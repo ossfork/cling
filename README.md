@@ -114,37 +114,58 @@ Processing and indexing file changes is very efficient and will not impact batte
 ### How it works
 
 ```
-Filesystem ──► fts_read / contentsOfDirectory
+Filesystem ──► fts_read (local) / FileManager (external)
                         │
                         ▼
-              ┌───────────────────┐
-              │  Binary Index     │  one .idx per scope/volume
-              │  parallel arrays: │  persists across launches
-              │   · path bytes    │
-              │   · char bitmasks │
-              │   · extension IDs │
-              └────────┬──────────┘
+              ┌───────────────────────┐
+              │  Binary Index (.idx)  │  one per scope/volume
+              │  parallel arrays:     │  persists across launches
+              │   · path bytes (LC)   │
+              │   · 64-bit bitmasks   │
+              │   · basename bitmasks │
+              │   · word boundaries   │
+              │   · extension IDs     │
+              └────────┬──────────────┘
                        │ load (mmap + memcpy)
                        ▼
-              ┌───────────────────┐
-         ┌───►│  Search Engine    │◄──── FSEvents (live updates)
-         │    └────────┬──────────┘
-      query            │
-                       ▼
-              Phase 1: Filter
-               · 64-bit bitmask precheck
-               · extension + prefix matching
-               · parallel across cores
+              ┌───────────────────────┐
+              │  Search Engines       │◄── FSEvents (live updates)
+              │  · per-scope (Home,   │◄── MDQuery  (recents)
+              │    Apps, Library, …) │
+              │  · per-volume         │
+              │  · recents            │
+              └────────┬──────────────┘
+                       │
+                    query  →  parse into fuzzy / extension /
+                              folder / dir-segment tokens
                        │
                        ▼
-              Phase 2: Score
-               · fzf fuzzy scoring algorithm
-               · parallel across cores
+              Phase 1: Filter (parallel across cores)
+               · 64-bit bitmask precheck
+               · extension ID (UInt16 compare)
+               · folder prefix (sorted index or byte scan)
+               · dir-segment literal substring
+               · excluded paths (O(1) set lookup)
+               · QuickFilter pre-filtered pools
+                       │
+                       ▼
+              Phase 2: Score (parallel across cores)
+               · fzf fuzzy scoring (basename + full path)
+               · multi-token independent scoring
+               · SIMD byte search for long paths
+               · boundary/camelCase/delimiter bonuses
+                       │
+                       ▼
+              Multi-engine Orchestration
+               · best engine first → instant results
+               · remaining engines in parallel (TaskGroup)
                        │
                        ▼
               Merge + Rank
-               · multi-engine merge
-               · sort by basename, prefix, tightness, depth
+               · quality gate (top-third filter)
+               · composite rank: score, importance,
+                 prefix match, basename match, depth
+               · deduplicate by path
                        │
                        ▼
                     Results
