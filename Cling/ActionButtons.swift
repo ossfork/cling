@@ -111,7 +111,7 @@ struct ActionButtons: View {
     @ViewBuilder
     private var shelveButton: some View {
         if let shelf = shelfApp.existingFilePath?.url {
-            Button("⌘F Shelve in \(shelfApp.filePath?.stem ?? "shelf app")") {
+            Button("⌘S Shelve in \(shelfApp.filePath?.stem ?? "shelf app")") {
                 RH.trackRun(selectedResults)
                 let config = NSWorkspace.OpenConfiguration()
                 config.activates = false
@@ -120,7 +120,7 @@ struct ActionButtons: View {
                     completionHandler: { _, _ in }
                 )
             }
-            .keyboardShortcut("f", modifiers: [.command])
+            .keyboardShortcut("s", modifiers: [.command])
             .help("Shelve the selected files in \(shelfApp.filePath?.stem ?? "shelf app")")
         }
     }
