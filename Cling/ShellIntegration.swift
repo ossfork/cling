@@ -36,7 +36,8 @@ class ShellIntegration {
                 guard rcFile.exists else { continue }
                 let contents = (try? String(contentsOf: rcFile.url)) ?? ""
                 if !contents.contains(".local/bin") {
-                    try (contents + "\n\(pathExport)\n").write(to: rcFile.url, atomically: true, encoding: .utf8)
+                    let resolvedURL = rcFile.url.resolvingSymlinksInPath()
+                    try (contents + "\n\(pathExport)\n").write(to: resolvedURL, atomically: true, encoding: .utf8)
                 }
             }
 
@@ -45,7 +46,8 @@ class ShellIntegration {
             if fishConfig.exists {
                 let contents = (try? String(contentsOf: fishConfig.url)) ?? ""
                 if !contents.contains(".local/bin") {
-                    try (contents + "\nfish_add_path $HOME/.local/bin\n").write(to: fishConfig.url, atomically: true, encoding: .utf8)
+                    let resolvedURL = fishConfig.url.resolvingSymlinksInPath()
+                    try (contents + "\nfish_add_path $HOME/.local/bin\n").write(to: resolvedURL, atomically: true, encoding: .utf8)
                 }
             }
 
