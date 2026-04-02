@@ -49,6 +49,7 @@ struct SettingsView: View {
     }
 
     @State private var showCLIAlert = false
+    @State private var showCLIPathAlert = false
     @State private var cliInstallMessage = ""
     @State private var cliInstallSuccess = false
     @EnvironmentObject var env: EnvState
@@ -112,7 +113,11 @@ struct SettingsView: View {
                     Button(CLING_CLI_LINK.exists ? "Reinstall" : "Install") {
                         cliInstallMessage = ShellIntegration.installCLI()
                         cliInstallSuccess = CLING_CLI_LINK.exists
-                        showCLIAlert = true
+                        if cliInstallSuccess, ShellIntegration.needsPathSetup {
+                            showCLIPathAlert = true
+                        } else {
+                            showCLIAlert = true
+                        }
                     }
                     .truncationMode(.middle)
                 }
@@ -128,6 +133,23 @@ struct SettingsView: View {
                 actions: {}
             ) {
                 Text(cliInstallMessage)
+            }
+            .alert("Add to PATH?", isPresented: $showCLIPathAlert) {
+                Button("Add Automatically") {
+                    ShellIntegration.addPathToShellConfigs()
+                    cliInstallMessage = "\(cliInstallMessage)\n\nPATH updated. Restart your shell to apply."
+                    showCLIAlert = true
+                }
+                Button("Copy to Clipboard") {
+                    ShellIntegration.copyPathExportToClipboard()
+                    cliInstallMessage = "\(cliInstallMessage)\n\nPATH export command copied to clipboard. Paste it into your shell config."
+                    showCLIAlert = true
+                }
+                Button("Skip", role: .cancel) {
+                    showCLIAlert = true
+                }
+            } message: {
+                Text("\(cliInstallMessage)\n\n~/.local/bin is not in your shell PATH. Add it automatically to your shell config files?")
             }
 
             Toggle(isOn: $showWindowAtLaunch) {
