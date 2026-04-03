@@ -36,6 +36,25 @@ struct SettingsView: View {
     @Default(.externalVolumes) private var externalVolumes
     @Default(.copyPathsWithTilde) private var copyPathsWithTilde
 
+    private var windowMode: Binding<WindowMode> {
+        Binding(
+            get: { showDockIcon ? .desktopApp : .launcher },
+            set: { mode in
+                switch mode {
+                case .launcher:
+                    showDockIcon = false
+                    keepWindowOpenWhenDefocused = false
+                case .desktopApp:
+                    showDockIcon = true
+                    keepWindowOpenWhenDefocused = true
+                }
+                NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
+                NSApp.activate(ignoringOtherApps: true)
+                AppDelegate.shared?.keepSettingsFrontUntil = .now + 2
+            }
+        )
+    }
+
     private func selectApp(type: String, onCompletion: @escaping (URL) -> Void) {
         let panel = NSOpenPanel()
         panel.title = "Select \(type) App"
@@ -56,50 +75,105 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            LaunchAtLogin.Toggle()
-            Toggle("Show Dock icon", isOn: $showDockIcon)
-                .onChange(of: showDockIcon) {
-                    NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
+            Section(header: Text("Window behaviour")) {
+                LaunchAtLogin.Toggle()
+                Picker(selection: windowMode) {
+                    ForEach(WindowMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                } label: {
+                    (
+                        Text("Window mode")
+                            + Text("\nSecret Tool: no Dock icon, hides on defocus\nDesktop App: regular app window, dock icon visible")
+                            .round(11, weight: .regular).foregroundColor(.secondary)
+                    ).fixedSize()
                 }
+                Toggle("Show Dock icon", isOn: $showDockIcon)
+                    .onChange(of: showDockIcon) {
+                        NSApp.setActivationPolicy(showDockIcon ? .regular : .accessory)
+                        NSApp.activate(ignoringOtherApps: true)
+                        AppDelegate.shared?.keepSettingsFrontUntil = .now + 2
+                    }
+                    .padding(.leading, 20)
+                Toggle(isOn: $keepWindowOpenWhenDefocused) {
+                    (
+                        Text("Keep window open when the app is in background")
+                            + Text("\nDon't close the window when clicking outside the app")
+                            .round(11, weight: .regular).foregroundColor(.secondary)
+                    ).fixedSize()
+                }
+                .padding(.leading, 20)
+                Toggle(isOn: $showWindowAtLaunch) {
+                    (
+                        Text("Show window at launch")
+                            + Text("\nShow the main window when Cling is first launched")
+                            .round(11, weight: .regular).foregroundColor(.secondary)
+                    ).fixedSize()
+                }
+                Picker(selection: $windowAppearance) {
+                    ForEach(WindowAppearance.allCases.filter(\.available), id: \.self) { appearance in
+                        Text(appearance.rawValue).tag(appearance)
+                    }
+                } label: {
+                    (
+                        Text("Window style")
+                            + Text("\nChoose the window background appearance")
+                            .round(11, weight: .regular).foregroundColor(.secondary)
+                    ).fixedSize()
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("Global hotkey", isOn: $enableGlobalHotkey)
+                    HStack {
+                        DirectionalModifierView(triggerKeys: $triggerKeys)
+                            .disabled(!enableGlobalHotkey)
+                        Text("+").heavy(12)
+                        DynamicKey(key: $showAppKey, recording: $env.recording, allowedKeys: .ALL_KEYS)
+                    }
+                    .disabled(!enableGlobalHotkey)
+                    .opacity(enableGlobalHotkey ? 1 : 0.5)
+                }
+            }
 
-            HStack {
-                (
-                    Text("Text editor")
-                        + Text("\nUsed for editing text files")
-                        .round(11, weight: .regular).foregroundColor(.secondary)
-                ).fixedSize()
-                Spacer()
-                Button(editorApp.filePath?.stem ?? "TextEdit") {
-                    selectApp(type: "Text Editor") { url in
-                        editorApp = url.path
-                    }
-                }.truncationMode(.middle)
-            }
-            HStack {
-                (
-                    Text("Terminal")
-                        + Text("\nUsed for running shell commands and opening folders")
-                        .round(11, weight: .regular).foregroundColor(.secondary)
-                ).fixedSize()
-                Spacer()
-                Button(terminalApp.filePath?.stem ?? "Terminal") {
-                    selectApp(type: "Terminal") { url in
-                        terminalApp = url.path
-                    }
-                }.truncationMode(.middle)
-            }
-            HStack {
-                (
-                    Text("Shelf app")
-                        + Text("\nUsed for shelving files with ⌘F (e.g. Yoink, Dropover)")
-                        .round(11, weight: .regular).foregroundColor(.secondary)
-                ).fixedSize()
-                Spacer()
-                Button(shelfApp.filePath?.stem ?? "None") {
-                    selectApp(type: "Shelf") { url in
-                        shelfApp = url.path
-                    }
-                }.truncationMode(.middle)
+            Section(header: Text("Default Apps")) {
+                HStack {
+                    (
+                        Text("Text editor")
+                            + Text("\nUsed for editing text files")
+                            .round(11, weight: .regular).foregroundColor(.secondary)
+                    ).fixedSize()
+                    Spacer()
+                    Button(editorApp.filePath?.stem ?? "TextEdit") {
+                        selectApp(type: "Text Editor") { url in
+                            editorApp = url.path
+                        }
+                    }.truncationMode(.middle)
+                }
+                HStack {
+                    (
+                        Text("Terminal")
+                            + Text("\nUsed for running shell commands and opening folders")
+                            .round(11, weight: .regular).foregroundColor(.secondary)
+                    ).fixedSize()
+                    Spacer()
+                    Button(terminalApp.filePath?.stem ?? "Terminal") {
+                        selectApp(type: "Terminal") { url in
+                            terminalApp = url.path
+                        }
+                    }.truncationMode(.middle)
+                }
+                HStack {
+                    (
+                        Text("Shelf app")
+                            + Text("\nUsed for shelving files with ⌘F (e.g. Yoink, Dropover)")
+                            .round(11, weight: .regular).foregroundColor(.secondary)
+                    ).fixedSize()
+                    Spacer()
+                    Button(shelfApp.filePath?.stem ?? "None") {
+                        selectApp(type: "Shelf") { url in
+                            shelfApp = url.path
+                        }
+                    }.truncationMode(.middle)
+                }
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -152,70 +226,12 @@ struct SettingsView: View {
                 Text("\(cliInstallMessage)\n\n~/.local/bin is not in your shell PATH. Add it automatically to your shell config files?")
             }
 
-            Toggle(isOn: $showWindowAtLaunch) {
-                (
-                    Text("Show window at launch")
-                        + Text("\nShow the main window when Cling is first launched")
-                        .round(11, weight: .regular).foregroundColor(.secondary)
-                ).fixedSize()
-            }
-            Toggle(isOn: $keepWindowOpenWhenDefocused) {
-                (
-                    Text("Keep window open when the app is in background")
-                        + Text("\nDon't close, only hide the window when clicking outside the app")
-                        .round(11, weight: .regular).foregroundColor(.secondary)
-                ).fixedSize()
-            }
             Toggle(isOn: $copyPathsWithTilde) {
                 (
-                    Text("Use ~ in copied paths")
-                        + Text("\nReplace /Users/\(NSUserName())/ with ~/ when copying or exporting paths")
+                    Text("Use `~/` (tilde) in copied paths")
+                        + Text("\nReplace `/Users/\(NSUserName())/` with `~/` when copying or exporting paths")
                         .round(11, weight: .regular).foregroundColor(.secondary)
                 ).fixedSize()
-            }
-            HStack {
-                Picker(selection: $defaultResultsMode) {
-                    ForEach(DefaultResultsMode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                } label: {
-                    (
-                        Text("Default results")
-                            + Text("\nWhat to show when no query or filter is active")
-                            .round(11, weight: .regular).foregroundColor(.secondary)
-                    ).fixedSize()
-                }
-                if defaultResultsMode == .runHistory {
-                    Button("Reset") {
-                        RH.clearAll()
-                        FUZZY.updateDefaultResults()
-                    }
-                    .font(.system(size: 11))
-                }
-            }
-
-            Picker(selection: $windowAppearance) {
-                ForEach(WindowAppearance.allCases.filter(\.available), id: \.self) { appearance in
-                    Text(appearance.rawValue).tag(appearance)
-                }
-            } label: {
-                (
-                    Text("Window style")
-                        + Text("\nChoose the window background appearance")
-                        .round(11, weight: .regular).foregroundColor(.secondary)
-                ).fixedSize()
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
-                Toggle("Global hotkey", isOn: $enableGlobalHotkey)
-                HStack {
-                    DirectionalModifierView(triggerKeys: $triggerKeys)
-                        .disabled(!enableGlobalHotkey)
-                    Text("+").heavy(12)
-                    DynamicKey(key: $showAppKey, recording: $env.recording, allowedKeys: .ALL_KEYS)
-                }
-                .disabled(!enableGlobalHotkey)
-                .opacity(enableGlobalHotkey ? 1 : 0.5)
             }
 
             Section(header: Text("Search")) {
@@ -269,6 +285,26 @@ struct SettingsView: View {
                             }
                         }
                         .frame(width: 120)
+                    }
+                }
+                Picker(selection: $defaultResultsMode) {
+                    ForEach(DefaultResultsMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                } label: {
+                    HStack {
+                        (
+                            Text("Default results")
+                                + Text("\nWhat to show when no query or filter is active")
+                                .round(11, weight: .regular).foregroundColor(.secondary)
+                        ).fixedSize()
+                        if defaultResultsMode == .runHistory {
+                            Button("Reset") {
+                                RH.clearAll()
+                                FUZZY.updateDefaultResults()
+                            }
+                            .font(.system(size: 11))
+                        }
                     }
                 }
 
@@ -385,17 +421,19 @@ struct SettingsView: View {
             }
 
             if let pro = PM.pro {
-                LicenseView(pro: pro)
-                #if DEBUG
-                    HStack {
-                        Button("Reset Trial") {
-                            AppDelegate.shared?.resetTrial()
+                Section(header: Text("Pro License")) {
+                    LicenseView(pro: pro)
+                    #if DEBUG
+                        HStack {
+                            Button("Reset Trial") {
+                                AppDelegate.shared?.resetTrial()
+                            }
+                            Button("Expire Trial") {
+                                AppDelegate.shared?.expireTrial()
+                            }
                         }
-                        Button("Expire Trial") {
-                            AppDelegate.shared?.expireTrial()
-                        }
-                    }
-                #endif
+                    #endif
+                }
             }
 
             #if DEBUG
@@ -448,12 +486,12 @@ struct SettingsView: View {
     @Default(.terminalApp) private var terminalApp
     @Default(.shelfApp) private var shelfApp
 
-    private func scopeRow(_ scope: SearchScope, label: String, detail: String) -> some View {
+    private func scopeRow(_ scope: SearchScope, label: String, detail: LocalizedStringKey) -> some View {
         HStack {
             Toggle(isOn: scope.binding) {
                 (
                     Text(label)
-                        + Text("\n\(detail)")
+                        + Text("\n") + Text(detail)
                         .font(.system(size: 11)).foregroundColor(.secondary)
                 ).fixedSize()
             }

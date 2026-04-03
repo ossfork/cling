@@ -83,6 +83,8 @@ class AppDelegate: LowtechProAppDelegate {
 
     static var shared: AppDelegate!
 
+    var keepSettingsFrontUntil: Date?
+
     var mainWindow: NSWindow? {
         NSApp.windows.first { $0.title == "Cling" }
     }
@@ -184,18 +186,21 @@ class AppDelegate: LowtechProAppDelegate {
                 WM.size = newSize
             }
 
-        if !Defaults[.showDockIcon] {
-            NSApp.setActivationPolicy(.accessory)
-        }
-
         let skipWindow = CommandLine.arguments.contains("--hidden")
-        if Defaults[.showWindowAtLaunch], !skipWindow {
-            WM.open("main")
-            mainWindow?.becomeMain()
-            mainWindow?.becomeKey()
-            focus()
-        } else if !skipWindow {
+        if !Defaults[.onboardingCompleted] {
+            // Keep dock icon visible during onboarding
             mainWindow?.close()
+            WM.open("onboarding")
+        } else {
+            NSApp.setActivationPolicy(Defaults[.showDockIcon] ? .regular : .accessory)
+            if Defaults[.showWindowAtLaunch], !skipWindow {
+                WM.open("main")
+                mainWindow?.becomeMain()
+                mainWindow?.becomeKey()
+                focus()
+            } else if !skipWindow {
+                mainWindow?.close()
+            }
         }
     }
 
@@ -212,12 +217,15 @@ class AppDelegate: LowtechProAppDelegate {
 
     override func applicationDidResignActive(_ notification: Notification) {
 //        log.debug("Resigned active")
-        settingsWindow?.close()
+        let settingsVisible = settingsWindow?.isVisible ?? false
+        if !Defaults[.keepWindowOpenWhenDefocused], !settingsVisible {
+            settingsWindow?.close()
+        }
         guard !WM.pinned else {
             mainWindow?.alphaValue = 0.75
             return
         }
-        guard !Defaults[.keepWindowOpenWhenDefocused] else {
+        guard !Defaults[.keepWindowOpenWhenDefocused], !settingsVisible else {
             return
         }
         WM.mainWindowActive = false
@@ -335,6 +343,12 @@ class AppDelegate: LowtechProAppDelegate {
                 window.backgroundColor = .clear
             }
             WM.size = window.frame.size
+
+            if let until = keepSettingsFrontUntil, Date.now < until {
+                settingsWindow?.makeKeyAndOrderFront(nil)
+            } else {
+                keepSettingsFrontUntil = nil
+            }
         }
     }
     func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
@@ -505,6 +519,13 @@ struct ClingApp: App {
             NSApp.keyWindow?.orderFrontRegardless()
             wm.windowToOpen = nil
         }
+
+        Window("Welcome to Cling", id: "onboarding") {
+            OnboardingView()
+                .environmentObject(envState)
+        }
+        .windowResizability(.contentSize)
+        .windowStyle(.hiddenTitleBar)
 
         Settings {
             SettingsView()

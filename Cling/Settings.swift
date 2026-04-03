@@ -354,6 +354,7 @@ extension Defaults.Keys {
     static let reindexTimeIntervalPerVolume = Key<[FilePath: Double]>("reindexTimeIntervalPerVolume", default: [:])
     static let windowAppearance = Key<WindowAppearance>("windowAppearance", default: WindowAppearance.defaultValue)
     static let migrationVersion = Key<Int>("migrationVersion", default: 0)
+    static let onboardingCompleted = Key<Bool>("onboardingCompleted", default: false)
 
     static let blockedPrefixes = Key<String>("blockedPrefixes", default: """
     /tmp/com.apple.

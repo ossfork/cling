@@ -539,15 +539,17 @@ class FuzzyClient {
         startIndex()
 
         if !hasFullDiskAccess {
-            // Show FDA prompt non-blocking, re-index when granted
-            FullDiskAccess.promptIfNotGranted(
-                title: "Enable Full Disk Access for Cling",
-                message: "Cling requires Full Disk Access to index the files on the whole disk.",
-                settingsButtonTitle: "Open Settings",
-                skipButtonTitle: "Skip",
-                canBeSuppressed: false,
-                icon: nil
-            )
+            // Skip the modal FDA prompt if onboarding will handle it
+            if Defaults[.onboardingCompleted] {
+                FullDiskAccess.promptIfNotGranted(
+                    title: "Enable Full Disk Access for Cling",
+                    message: "Cling requires Full Disk Access to index the files on the whole disk.",
+                    settingsButtonTitle: "Open Settings",
+                    skipButtonTitle: "Skip",
+                    canBeSuppressed: false,
+                    icon: nil
+                )
+            }
             fullDiskAccessChecker = Repeater(every: 2) {
                 guard FullDiskAccess.isGranted else { return }
                 self.hasFullDiskAccess = true
