@@ -190,6 +190,8 @@ class FuzzyClient {
     @ObservationIgnored var scopeIndexTask: Task<Void, Never>?
     @ObservationIgnored var volumeIndexTasks: [FilePath: Task<Void, Never>] = [:]
     var volumesIndexing: Set<FilePath> = []
+    /// Scopes currently part of the active `indexFiles` batch (either running or queued inside it).
+    var scopesIndexing: Set<SearchScope> = []
     @ObservationIgnored var cliMachPortThread: Thread?
 
     // MARK: - Search Engines (per-scope + recents)
@@ -213,12 +215,14 @@ class FuzzyClient {
     /// Log an activity. Set `ongoing: true` for operations in progress (shows spinner).
     /// Set `ongoing: false` (default) for completed operations (clears spinner after logging).
     @ObservationIgnored var ongoingOperations: [String: String] = [:]
+    @ObservationIgnored var ongoingOperationCounts: [String: Int] = [:]
     var ongoingOperationsList: [(key: String, message: String)] = []
 
     var backgroundIndexing = false {
         didSet {
             if !backgroundIndexing, !indexing {
                 ongoingOperations.removeAll()
+                ongoingOperationCounts.removeAll()
                 setOperation("")
             }
             searchCoordinator.setIndexing(indexing || backgroundIndexing)
@@ -362,6 +366,7 @@ class FuzzyClient {
         didSet {
             if !indexing, !backgroundIndexing {
                 ongoingOperations.removeAll()
+                ongoingOperationCounts.removeAll()
                 setOperation("")
             } else if indexing {
                 setOperation("Indexing files")
@@ -481,7 +486,7 @@ class FuzzyClient {
             }
         }
     }
-    func logActivity(_ message: String, ongoing: Bool = false, operationKey: String? = nil, timerKey: String? = nil) {
+    func logActivity(_ message: String, ongoing: Bool = false, operationKey: String? = nil, timerKey: String? = nil, count: Int? = nil) {
         var duration: Double?
         if let key = timerKey {
             if let start = activityTimers[key] {
@@ -497,10 +502,12 @@ class FuzzyClient {
         }
         if ongoing, let key = operationKey {
             ongoingOperations[key] = message
+            if let count { ongoingOperationCounts[key] = count }
             setOperation(compactOperationSummary())
         } else {
             if let key = operationKey {
                 ongoingOperations.removeValue(forKey: key)
+                ongoingOperationCounts.removeValue(forKey: key)
             }
             if !ongoingOperations.isEmpty {
                 setOperation(compactOperationSummary())
@@ -752,7 +759,7 @@ class FuzzyClient {
                 let opKey = "load:\(scope.rawValue)"
                 if eng.loadBinaryIndex(from: file.url, progress: { count in
                     Task { @MainActor in
-                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true, operationKey: opKey)
+                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true, operationKey: opKey, count: count)
                     }
                 }) {
                     await MainActor.run {
@@ -771,7 +778,7 @@ class FuzzyClient {
                 let opKey = "load:\(scope.rawValue)"
                 if eng.loadBinaryIndex(from: file.url, progress: { count in
                     Task { @MainActor in
-                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true, operationKey: opKey)
+                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true, operationKey: opKey, count: count)
                     }
                 }) {
                     await MainActor.run {
@@ -904,6 +911,7 @@ class FuzzyClient {
             return
         }
 
+        scopesIndexing.formUnion(scopes)
         bust_gitignore_cache()
         let ignoreChecker: String? = fsignore.exists ? fsignoreString : nil
 
@@ -927,7 +935,7 @@ class FuzzyClient {
                             let opKey = "scope:\(scope.rawValue)"
                             scopeEngine.walkDirectory(dir.dir, ignoreFile: ignore, skipDir: skipDir, progress: { count, _ in
                                 Task { @MainActor in
-                                    self.logActivity("Indexing \(scope.label): \(count.formatted()) files", ongoing: true, operationKey: opKey)
+                                    self.logActivity("Indexing \(scope.label): \(count.formatted()) files", ongoing: true, operationKey: opKey, count: count)
                                 }
                             })
                         }
@@ -946,6 +954,7 @@ class FuzzyClient {
 
                     await MainActor.run {
                         self.scopeEngines[scope] = scopeEngine
+                        self.scopesIndexing.remove(scope)
                         self.updateIndexedCount()
                         self.logActivity("Indexed \(scope.label): \(added.formatted()) files (\(self.indexedCount.formatted()) total)", operationKey: "scope:\(scope.rawValue)")
 
@@ -961,6 +970,7 @@ class FuzzyClient {
 
             await MainActor.run {
                 self.scopeIndexTask = nil
+                self.scopesIndexing.removeAll()
                 self.cleanRecentsEngine()
                 self.excludedPaths.removeAll()
                 onFinish?()
@@ -1616,7 +1626,8 @@ class FuzzyClient {
         case .home:
             var dirs: [(dir: String, excludePrefix: String?, applyIgnore: Bool)] = [(HOME.string, "\(HOME.string)/Library", true)]
             if FileManager.default.fileExists(atPath: "/Users/Shared") {
-                dirs.append(("/Users/Shared", nil, true))
+                // /Users/Shared is not under HOME, so ~/.fsignore (rooted at HOME) cannot be applied.
+                dirs.append(("/Users/Shared", nil, false))
             }
             return dirs
         case .library: return [("\(HOME.string)/Library", nil, true)]

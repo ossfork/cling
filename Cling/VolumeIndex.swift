@@ -181,7 +181,7 @@ extension FuzzyClient {
                 volume: volume, engine: volumeEngine, ignoreChecker: ignoreChecker,
                 progress: { count, _ in
                     Task { @MainActor in
-                        self.logActivity("Indexing \(volumeName): \(count.formatted()) files", ongoing: true, operationKey: opKey)
+                        self.logActivity("Indexing \(volumeName): \(count.formatted()) files", ongoing: true, operationKey: opKey, count: count)
                     }
                 },
                 cancelled: { Task.isCancelled }

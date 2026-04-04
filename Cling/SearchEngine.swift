@@ -1043,6 +1043,17 @@ final class SearchEngine: @unchecked Sendable {
         let ignoreContent: String? = ignoreFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
         let ignoredExtensions: Set<String> = ignoreContent.map { Self.extractExtensionPatterns(from: $0) } ?? []
 
+        // The gitignore (swift-ignore / Rust `ignore` crate) panics if queried with a path
+        // that is not a descendant of the ignore file's parent directory. Only apply the
+        // ignore check when the walked dir is actually under that root.
+        let ignoreRootPrefix: String? = ignoreFile.flatMap { f -> String? in
+            let parent = (f as NSString).deletingLastPathComponent
+            guard !parent.isEmpty else { return nil }
+            let prefix = parent.hasSuffix("/") ? parent : parent + "/"
+            return (dir == parent || dir.hasPrefix(prefix)) ? prefix : nil
+        }
+        let effectiveIgnoreFile: String? = ignoreRootPrefix != nil ? ignoreFile : nil
+
         var added = 0
         var skippedIgnore = 0
         var lastProgress = t0
@@ -1084,7 +1095,7 @@ final class SearchEngine: @unchecked Sendable {
 
                 let fullPath = String(decoding: UnsafeBufferPointer(start: pathPtr, count: pathLen), as: UTF8.self)
 
-                if let ignoreFile, fullPath.isIgnored(in: ignoreFile) {
+                if let effectiveIgnoreFile, fullPath.isIgnored(in: effectiveIgnoreFile) {
                     fts_set(ftsp, ent, Int32(FTS_SKIP))
                     skippedIgnore &+= 1
                     continue
@@ -1125,7 +1136,7 @@ final class SearchEngine: @unchecked Sendable {
                 }
 
                 let fullPath = String(decoding: UnsafeBufferPointer(start: pathPtr, count: pathLen), as: UTF8.self)
-                if let ignoreFile, fullPath.isIgnored(in: ignoreFile) {
+                if let effectiveIgnoreFile, fullPath.isIgnored(in: effectiveIgnoreFile) {
                     skippedIgnore &+= 1
                     continue
                 }
@@ -1173,6 +1184,15 @@ final class SearchEngine: @unchecked Sendable {
 
         let ignoreContent: String? = ignoreFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
         let ignoredExtensions: Set<String> = ignoreContent.map { Self.extractExtensionPatterns(from: $0) } ?? []
+
+        // Only apply ignore checks when the walked dir is under the ignore file's parent (see walkDirectory).
+        let ignoreRootPrefix: String? = ignoreFile.flatMap { f -> String? in
+            let parent = (f as NSString).deletingLastPathComponent
+            guard !parent.isEmpty else { return nil }
+            let prefix = parent.hasSuffix("/") ? parent : parent + "/"
+            return (dir == parent || dir.hasPrefix(prefix)) ? prefix : nil
+        }
+        let effectiveIgnoreFile: String? = ignoreRootPrefix != nil ? ignoreFile : nil
 
         // Load completed checkpoints from previous interrupted run
         var completedDirs = Set<String>()
@@ -1244,7 +1264,7 @@ final class SearchEngine: @unchecked Sendable {
 
                 if isDir {
                     if name == ".git" { continue }
-                    if let ignoreFile, path.isIgnored(in: ignoreFile) { continue }
+                    if let effectiveIgnoreFile, path.isIgnored(in: effectiveIgnoreFile) { continue }
                     if let skipDir, skipDir(path) { continue }
                     queue.append(url)
                 } else {
@@ -1252,7 +1272,7 @@ final class SearchEngine: @unchecked Sendable {
                         let ext = "." + (url.pathExtension.lowercased())
                         if ext.count > 1, ignoredExtensions.contains(ext) { continue }
                     }
-                    if let ignoreFile, path.isIgnored(in: ignoreFile) { continue }
+                    if let effectiveIgnoreFile, path.isIgnored(in: effectiveIgnoreFile) { continue }
                 }
 
                 batch.append((path, isDir))

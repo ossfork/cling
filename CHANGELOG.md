@@ -1,3 +1,43 @@
+# 2.1.1
+## Fixes
+
+- `cling reindex --wait` actually waits for indexing to finish again
+- Reindexing the **Home** scope no longer crashes when `/Users/Shared` is present
+- Running `cling reindex` while another reindex is already in progress now gives a clear message instead of silently doing nothing
+
+## CLI improvements
+
+- `cling status --json` outputs structured status for scripting, including per-scope and per-volume progress
+- `cling reindex --wait` shows live per-scope progress so you can tell exactly which scope is being worked on
+- `cling reindex --scope <name> --wait` can safely attach to an in-progress reindex of that scope instead of hanging
+
+# 2.1.0
+## Features
+
+- **Onboarding window** on first launch to choose window mode, style, hotkey, volumes, and grant **Full Disk Access**
+- Volume and folder filter indexing status shown in the filter picker (*Not indexed* / *Indexing...*)
+- Selecting an unindexed volume starts indexing automatically
+- **Parallel volume indexing** with per-volume cancel support
+- **Reindex All / Cancel All** buttons for scopes and volumes in Settings
+- `cling reindex --cancel` to cancel indexing from the CLI
+- `cling status` now shows per-scope and per-volume entry counts and **indexing progress**
+- Super fast **SMB indexing** and metadata caching for network volumes
+- Faster indexing for non-network volumes using `FTS_NOSTAT`
+
+## Changes
+
+- Shelve shortcut changed from `⌘F` to `⌘S` to match the Raycast extension and avoid conflicts with the common *Find* shortcut
+- **Settings sections** are now collapsible
+- Settings reorganized: window settings grouped together, default apps in their own section
+- Enabled volumes are now indexed automatically on launch
+- Selecting a volume filter deselects folder filters and vice versa
+
+## Fixes
+
+- CLI installation now preserves symlinked shell configs (`.zshrc`, `.bashrc`, `config.fish`) instead of replacing them with regular files
+- **Indexing progress** stays visible in the status bar during filter changes
+- Empty volume indexes are no longer saved to disk
+
 # 2.0.1
 ## Features
 

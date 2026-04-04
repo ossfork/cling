@@ -1,50 +1,9 @@
 import ArgumentParser
 import Foundation
 
-// MARK: - IPC Message Types (must match Cling app side)
-
-let CLING_PORT_ID = "com.lowtechguys.Cling.cli" as CFString
-
-enum ClingCommand: String, Codable {
-    case search
-    case index // backwards compat
-    case reindex
-    case cancelIndex
-    case status
-    case recents
-    case indexAdd
-    case indexRemove
-    case indexHas
-}
-
-struct ClingRequest: Codable {
-    let command: ClingCommand
-    var query: String?
-    var maxResults: Int?
-    var verbose: Bool?
-    var rebuild: Bool?
-    var dir: String?
-    var suffixPattern: String?
-    var folderPrefixes: [String]?
-    var dirsOnly: Bool?
-    var scopes: [String]?
-    var paths: [String]?
-}
-
-struct ClingSearchResult: Codable {
-    let path: String
-    let isDir: Bool
-    let score: Int
-    let quality: Int
-}
-
-struct ClingResponse: Codable {
-    var results: [ClingSearchResult]?
-    var status: String?
-    var error: String?
-    var indexCount: Int?
-    var searchMs: Double?
-}
+// IPC types (CLING_PORT_ID, ClingCommand, ClingRequest, ClingResponse,
+// ClingSearchResult, ClingScopeStatus, ClingVolumeStatus) live in
+// Shared/ClingIPC.swift and are compiled into both this tool and the Cling app.
 
 // MARK: - Lightweight Mach Port Client (raw CFMessagePort, no Lowtech dependency)
 
@@ -248,6 +207,25 @@ struct Reindex: ParsableCommand {
     mutating func run() throws {
         let volumes = scope.filter { $0.hasPrefix("/Volumes/") || $0.hasPrefix("/Volumes") }
         let scopes = scope.filter { !$0.hasPrefix("/Volumes") }
+
+        // Capture initial per-scope/volume last-indexed timestamps so the --wait loop
+        // can detect fast reindexes that complete between the request and the first poll.
+        var initialScopeTimestamps: [String: Double] = [:]
+        var initialVolumeTimestamps: [String: Double] = [:]
+        if wait, !cancel {
+            let statusReq = ClingRequest(command: .status)
+            if let statusData = try? sendMachPort(data: JSONEncoder().encode(statusReq), recvTimeout: 5),
+               let statusResp = try? JSONDecoder().decode(ClingResponse.self, from: statusData)
+            {
+                for s in statusResp.scopes ?? [] {
+                    if let ts = s.lastIndexedAt { initialScopeTimestamps[s.rawValue.lowercased()] = ts }
+                }
+                for v in statusResp.volumes ?? [] {
+                    if let ts = v.lastIndexedAt { initialVolumeTimestamps[v.path] = ts }
+                }
+            }
+        }
+
         let command: ClingCommand = cancel ? .cancelIndex : .reindex
         let request = ClingRequest(command: command, rebuild: rebuild, scopes: scopes.isEmpty && volumes.isEmpty ? nil : scopes, paths: volumes.isEmpty ? nil : volumes)
         guard let data = try sendMachPort(data: JSONEncoder().encode(request), recvTimeout: 300) else {
@@ -268,6 +246,19 @@ struct Reindex: ParsableCommand {
             return
         }
 
+        // Filter which scopes/volumes this wait invocation cares about.
+        // Empty filter = wait on whatever was indexing globally.
+        let scopeFilter = Set(scopes.map { $0.lowercased() })
+        let volumeFilter = Set(volumes)
+        let hasFilter = !scopeFilter.isEmpty || !volumeFilter.isEmpty
+
+        // Must observe at least one "indexing" poll before exiting, to avoid
+        // returning before the app picks up the reindex request. If we never see
+        // indexing within a grace period, assume nothing was actually started.
+        var sawIndexing = false
+        var pollsWithoutIndexing = 0
+        let gracePolls = 15
+
         fputs("indexing...", stderr)
         while true {
             Thread.sleep(forTimeInterval: 1)
@@ -276,11 +267,81 @@ struct Reindex: ParsableCommand {
                   let statusResp = try? JSONDecoder().decode(ClingResponse.self, from: statusData)
             else { continue }
 
-            fputs("\r\u{1B}[Kindexing... \(statusResp.indexCount ?? 0) entries", stderr)
-            if statusResp.status != "indexing..." {
+            let matchingScopes = (statusResp.scopes ?? []).filter { s in
+                guard hasFilter else { return s.indexing }
+                return scopeFilter.contains(s.rawValue.lowercased()) || scopeFilter.contains(s.name.lowercased())
+            }
+            let matchingVolumes = (statusResp.volumes ?? []).filter { v in
+                guard hasFilter else { return v.indexing }
+                return volumeFilter.contains(v.path) || volumeFilter.contains("/Volumes/\(v.name)")
+            }
+
+            let scopeParts = matchingScopes.compactMap { s -> String? in
+                if let opCount = s.operationCount {
+                    return "[\(s.name)] \(opCount.formatted()) files"
+                }
+                if let op = s.operation {
+                    return "[\(s.name)] \(op)"
+                }
+                return nil
+            }
+            let volumeParts = matchingVolumes.compactMap { v -> String? in
+                if let opCount = v.operationCount {
+                    return "[\(v.name)] \(opCount.formatted()) files"
+                }
+                if let op = v.operation {
+                    return "[\(v.name)] \(op)"
+                }
+                return nil
+            }
+            let progressLine = (scopeParts + volumeParts).joined(separator: "  ")
+            let liveCount = matchingScopes.reduce(0) { $0 + ($1.operationCount ?? 0) }
+                + matchingVolumes.reduce(0) { $0 + ($1.operationCount ?? 0) }
+            let finalCount = matchingScopes.reduce(0) { $0 + $1.count } + matchingVolumes.reduce(0) { $0 + $1.count }
+            let display = progressLine.isEmpty ? "indexing... \(finalCount.formatted()) entries" : progressLine
+            fputs("\r\u{1B}[K\(display)", stderr)
+
+            let anyScopeIndexing = matchingScopes.contains { $0.indexing }
+            let anyVolumeIndexing = matchingVolumes.contains { $0.indexing }
+            let state = statusResp.state ?? ""
+            let globalIndexing = state == "indexing" || state == "background indexing"
+            let stillIndexing = hasFilter ? (anyScopeIndexing || anyVolumeIndexing) : globalIndexing
+
+            // Detect fast-completion: any matching scope/volume whose lastIndexedAt
+            // is newer than our initial snapshot was reindexed during this wait.
+            var completedFast = false
+            if hasFilter, !stillIndexing, !sawIndexing {
+                let scopesTracked = matchingScopes.filter { initialScopeTimestamps[$0.rawValue.lowercased()] != nil || $0.lastIndexedAt != nil }
+                let volumesTracked = matchingVolumes.filter { initialVolumeTimestamps[$0.path] != nil || $0.lastIndexedAt != nil }
+                let scopesDone = !scopesTracked.isEmpty && scopesTracked.allSatisfy { s in
+                    guard let now = s.lastIndexedAt else { return false }
+                    let before = initialScopeTimestamps[s.rawValue.lowercased()] ?? 0
+                    return now > before
+                }
+                let volumesDone = volumesTracked.isEmpty || volumesTracked.allSatisfy { v in
+                    guard let now = v.lastIndexedAt else { return false }
+                    let before = initialVolumeTimestamps[v.path] ?? 0
+                    return now > before
+                }
+                completedFast = scopesDone && volumesDone
+            }
+
+            if stillIndexing {
+                sawIndexing = true
+                pollsWithoutIndexing = 0
+            } else {
+                pollsWithoutIndexing += 1
+            }
+            if !stillIndexing, sawIndexing || completedFast {
                 fputs("\n", stderr)
-                print("indexed: \(statusResp.indexCount ?? 0) entries")
+                let reportCount = finalCount > 0 ? finalCount : liveCount
+                print("indexed: \(reportCount.formatted()) entries")
                 break
+            }
+            if !sawIndexing, pollsWithoutIndexing >= gracePolls {
+                fputs("\n", stderr)
+                fputs("error: no indexing activity observed within \(gracePolls)s\n", stderr)
+                throw ExitCode.failure
             }
         }
     }
@@ -290,6 +351,9 @@ struct Reindex: ParsableCommand {
 
 struct Status: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Show index status")
+
+    @Flag(name: .long, help: "Output status as JSON")
+    var json = false
 
     mutating func run() throws {
         let request = ClingRequest(command: .status)
@@ -301,8 +365,24 @@ struct Status: ParsableCommand {
             fputs("error: invalid response\n", stderr)
             throw ExitCode.failure
         }
-        if let error = response.error { fputs("error: \(error)\n", stderr) }
-        else {
+        if let error = response.error {
+            fputs("error: \(error)\n", stderr)
+            throw ExitCode.failure
+        }
+        if json {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            let payload = ClingResponse(
+                indexCount: response.indexCount,
+                state: response.state,
+                operation: response.operation,
+                scopes: response.scopes,
+                volumes: response.volumes
+            )
+            if let out = try? encoder.encode(payload), let str = String(data: out, encoding: .utf8) {
+                print(str)
+            }
+        } else {
             print(response.status ?? "unknown")
         }
     }

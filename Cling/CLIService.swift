@@ -204,50 +204,10 @@ final class SearchCoordinator: @unchecked Sendable {
 
 }
 
-// MARK: - IPC Message Types (must match ClingCLI side)
-
-let CLING_PORT_ID = "com.lowtechguys.Cling.cli"
-
-enum ClingCommand: String, Codable {
-    case search
-    case index // backwards compat
-    case reindex
-    case cancelIndex
-    case status
-    case recents
-    case indexAdd
-    case indexRemove
-    case indexHas
-}
-
-struct ClingRequest: Codable {
-    let command: ClingCommand
-    var query: String?
-    var maxResults: Int?
-    var verbose: Bool?
-    var rebuild: Bool?
-    var dir: String?
-    var suffixPattern: String?
-    var folderPrefixes: [String]?
-    var dirsOnly: Bool?
-    var scopes: [String]?
-    var paths: [String]?
-}
-
-struct ClingSearchResult: Codable {
-    let path: String
-    let isDir: Bool
-    let score: Int
-    let quality: Int
-}
-
-struct ClingResponse: Codable {
-    var results: [ClingSearchResult]?
-    var status: String?
-    var error: String?
-    var indexCount: Int?
-    var searchMs: Double?
-}
+// IPC types (CLING_PORT_ID, ClingCommand, ClingRequest, ClingResponse,
+// ClingSearchResult, ClingScopeStatus, ClingVolumeStatus) live in
+// Shared/ClingIPC.swift so they can be shared between the Cling app and the
+// ClingCLI tool.
 
 private extension Encodable {
     var jsonData: Data { try! JSONEncoder().encode(self) }
@@ -265,7 +225,7 @@ extension FuzzyClient {
     }
 
     private func startMachPortListener() {
-        nonisolated(unsafe) let portName = CLING_PORT_ID as CFString
+        nonisolated(unsafe) let portName = CLING_PORT_ID
         let coord = searchCoordinator
 
         cliMachPortThread = Thread {
@@ -324,23 +284,79 @@ extension FuzzyClient {
         case .index, .reindex:
             let scopes = request.scopes?.compactMap { SearchScope(rawValue: $0) }
             let volumePaths = request.paths?.compactMap(\.filePath) ?? []
-            mainActor {
-                if !volumePaths.isEmpty {
-                    for volume in volumePaths {
-                        if FUZZY.enabledVolumes.contains(volume) {
-                            FUZZY.indexVolume(volume)
-                        }
+
+            // Synchronously check for conflicts with any in-flight indexing and decide
+            // whether to start a new batch, attach to the existing one, or reject.
+            // 0 = started, 1 = attached, 2 = conflict
+            var decisionKind = 0
+            var decisionMessage = ""
+            var decisionLabels: [String] = []
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                defer { sem.signal() }
+                let activeScopeIndexing = FUZZY.scopesIndexing
+                let activeVolumeIndexing = FUZZY.volumesIndexing
+                let anyActive = !activeScopeIndexing.isEmpty || !activeVolumeIndexing.isEmpty || FUZZY.indexing
+
+                let requestedScopes = scopes ?? []
+                let requestedVolumes = volumePaths
+
+                if anyActive {
+                    // "Reindex all" while anything is running is a conflict.
+                    if requestedScopes.isEmpty, requestedVolumes.isEmpty {
+                        decisionKind = 2
+                        decisionMessage = "another indexing operation is in progress; wait for it to finish or cancel it first"
+                        return
+                    }
+
+                    // Any requested scope/volume not already in the active batch is a conflict,
+                    // because indexFiles() would silently drop the new request.
+                    let conflictingScopes = requestedScopes.filter { !activeScopeIndexing.contains($0) }
+                    let conflictingVolumes = requestedVolumes.filter { !activeVolumeIndexing.contains($0) }
+
+                    if !conflictingScopes.isEmpty || !conflictingVolumes.isEmpty {
+                        var parts = [String]()
+                        if !conflictingScopes.isEmpty { parts.append(conflictingScopes.map(\.label).joined(separator: ", ")) }
+                        if !conflictingVolumes.isEmpty { parts.append(conflictingVolumes.map(\.name.string).joined(separator: ", ")) }
+                        decisionKind = 2
+                        decisionMessage = "cannot start reindex for \(parts.joined(separator: ", ")): another indexing operation is in progress; wait for it to finish or cancel it first"
+                        return
+                    }
+
+                    // Everything requested is already in flight — attach.
+                    decisionKind = 1
+                    decisionLabels = requestedScopes.map(\.label) + requestedVolumes.map(\.name.string)
+                    return
+                }
+
+                // Nothing running: start the requested work.
+                if !requestedVolumes.isEmpty {
+                    for volume in requestedVolumes where FUZZY.enabledVolumes.contains(volume) {
+                        FUZZY.indexVolume(volume)
                     }
                 }
-                if scopes != nil || volumePaths.isEmpty {
+                if scopes != nil || requestedVolumes.isEmpty {
                     FUZZY.refresh(pauseSearch: request.rebuild ?? false, scopes: scopes)
                 }
+                decisionKind = 0
+                decisionLabels = requestedScopes.map(\.label) + requestedVolumes.map(\.name.string)
             }
-            var labels = [String]()
-            if let scopes { labels.append(contentsOf: scopes.map(\.label)) }
-            if !volumePaths.isEmpty { labels.append(contentsOf: volumePaths.map(\.name.string)) }
-            let scopeLabel = labels.isEmpty ? "all" : labels.joined(separator: ", ")
-            return ClingResponse(status: "indexing started (\(scopeLabel))", indexCount: coord.count)
+            sem.wait()
+
+            switch decisionKind {
+            case 2:
+                return ClingResponse(error: decisionMessage)
+            case 1:
+                let label = decisionLabels.isEmpty ? "all" : decisionLabels.joined(separator: ", ")
+                return ClingResponse(
+                    status: "already indexing (\(label)); attaching to in-progress operation",
+                    indexCount: coord.count,
+                    state: "indexing"
+                )
+            default:
+                let label = decisionLabels.isEmpty ? "all" : decisionLabels.joined(separator: ", ")
+                return ClingResponse(status: "indexing started (\(label))", indexCount: coord.count)
+            }
 
         case .cancelIndex:
             let volumePaths = request.paths?.compactMap(\.filePath) ?? []
@@ -362,6 +378,10 @@ extension FuzzyClient {
         case .status:
             let c = coord.count
             var details = ""
+            var stateOut = ""
+            var operationOut: String?
+            var scopeStatuses: [ClingScopeStatus] = []
+            var volumeStatuses: [ClingVolumeStatus] = []
             let sem = DispatchSemaphore(value: 0)
             DispatchQueue.main.async {
                 defer { sem.signal() }
@@ -369,19 +389,40 @@ extension FuzzyClient {
 
                 // Overall status
                 let state = FUZZY.indexing ? "indexing" : FUZZY.backgroundIndexing ? "background indexing" : (c > 0 ? "ready" : "empty")
+                stateOut = state
                 lines.append("status: \(state)")
                 lines.append("total: \(c.formatted()) entries")
 
                 // Scope details
                 let enabledScopes = Defaults[.searchScopes]
+                let ops = FUZZY.ongoingOperations
+                let opCounts = FUZZY.ongoingOperationCounts
                 lines.append("")
                 lines.append("scopes:")
                 for scope in SearchScope.allCases {
                     let enabled = enabledScopes.contains(scope)
                     let count = FUZZY.scopeEngines[scope]?.count ?? 0
                     let indexed = FUZZY.scopeEngines[scope] != nil
-                    let status = !enabled ? "disabled" : !indexed ? (FUZZY.indexing ? "indexing..." : "not indexed") : "\(count.formatted()) entries"
+                    let scopeKey = "scope:\(scope.rawValue)"
+                    let loadKey = "load:\(scope.rawValue)"
+                    let scopeOp = ops[scopeKey] ?? ops[loadKey]
+                    let scopeOpCount = opCounts[scopeKey] ?? opCounts[loadKey]
+                    let scopeIndexing = scopeOp != nil
+                    let status = !enabled ? "disabled" : scopeIndexing ? (scopeOp ?? "indexing...") : !indexed ? "not indexed" : "\(count.formatted()) entries"
                     lines.append("  \(scope.label): \(status)")
+                    let scopeFile = scopeIndexFile(scope)
+                    let lastIndexedAt = scopeFile.exists ? scopeFile.timestamp : nil
+                    scopeStatuses.append(ClingScopeStatus(
+                        name: scope.label,
+                        rawValue: scope.rawValue,
+                        enabled: enabled,
+                        indexed: indexed,
+                        indexing: scopeIndexing,
+                        count: count,
+                        operation: scopeOp,
+                        operationCount: scopeOpCount,
+                        lastIndexedAt: lastIndexedAt
+                    ))
                 }
 
                 // Volume details
@@ -390,11 +431,27 @@ extension FuzzyClient {
                     lines.append("volumes:")
                     for volume in FUZZY.externalVolumes {
                         let enabled = FUZZY.enabledVolumes.contains(volume)
-                        let indexing = FUZZY.volumesIndexing.contains(volume)
+                        let volKey = "volume:\(volume.string)"
+                        let volumeOp = ops[volKey]
+                        let volumeOpCount = opCounts[volKey]
+                        let indexing = FUZZY.volumesIndexing.contains(volume) || volumeOp != nil
                         let count = FUZZY.volumeEngines[volume]?.count ?? 0
                         let indexed = FUZZY.volumeEngines[volume] != nil
-                        let status = !enabled ? "disabled" : indexing ? "indexing..." : !indexed ? "not indexed" : "\(count.formatted()) entries"
+                        let status = !enabled ? "disabled" : indexing ? (volumeOp ?? "indexing...") : !indexed ? "not indexed" : "\(count.formatted()) entries"
                         lines.append("  \(volume.name.string) (\(volume.shellString)): \(status)")
+                        let volFile = volumeIndexFile(volume)
+                        let lastIndexedAt = volFile.exists ? volFile.timestamp : nil
+                        volumeStatuses.append(ClingVolumeStatus(
+                            name: volume.name.string,
+                            path: volume.shellString,
+                            enabled: enabled,
+                            indexed: indexed,
+                            indexing: indexing,
+                            count: count,
+                            operation: volumeOp,
+                            operationCount: volumeOpCount,
+                            lastIndexedAt: lastIndexedAt
+                        ))
                     }
                 }
 
@@ -402,6 +459,7 @@ extension FuzzyClient {
                 if !FUZZY.operation.isEmpty {
                     lines.append("")
                     lines.append("operation: \(FUZZY.operation)")
+                    operationOut = FUZZY.operation
                 }
 
                 details = lines.joined(separator: "\n")
@@ -409,10 +467,18 @@ extension FuzzyClient {
             if sem.wait(timeout: .now() + 5) == .timedOut {
                 return ClingResponse(
                     status: coord.indexing ? "indexing..." : (c > 0 ? "ready" : "empty"),
-                    indexCount: c
+                    indexCount: c,
+                    state: coord.indexing ? "indexing" : (c > 0 ? "ready" : "empty")
                 )
             }
-            return ClingResponse(status: details, indexCount: c)
+            return ClingResponse(
+                status: details,
+                indexCount: c,
+                state: stateOut,
+                operation: operationOut,
+                scopes: scopeStatuses,
+                volumes: volumeStatuses
+            )
 
         case .recents:
             let maxResults = request.maxResults ?? 50
