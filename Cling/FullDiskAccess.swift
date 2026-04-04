@@ -143,7 +143,7 @@ extension FullDiskAccess {
 
     private static var promptSuppressed: Bool {
         get {
-            UserDefaults.standard.bool(forKey: "fda_suppressed") ?? false
+            UserDefaults.standard.bool(forKey: "fda_suppressed")
         }
         set {
             UserDefaults.standard.setValue(newValue, forKey: "fda_suppressed")

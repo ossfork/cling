@@ -50,19 +50,80 @@ struct FilterPicker: View {
         }
     }
 
+    private enum IndexStatus {
+        case indexed, indexing, notIndexed, disconnected
+    }
+
+    private func volumeStatus(_ volume: FilePath) -> IndexStatus {
+        if volume == .root { return .indexed }
+        if fuzzy.disconnectedVolumes.contains(volume) {
+            if fuzzy.volumeEngines[volume] != nil { return .disconnected }
+            return .disconnected
+        }
+        if fuzzy.volumesIndexing.contains(volume) { return .indexing }
+        if fuzzy.volumeEngines[volume] != nil { return .indexed }
+        return .notIndexed
+    }
+
+    private func scopeForFolder(_ folder: FilePath) -> SearchScope? {
+        let s = folder.string
+        let home = HOME.string
+        if s.hasPrefix(home + "/Library") { return .library }
+        if s.hasPrefix(home) { return .home }
+        if s.hasPrefix("/Applications") || s.hasPrefix("/System/Applications") { return .applications }
+        if s.hasPrefix("/System") { return .system }
+        if ["/usr", "/bin", "/sbin", "/opt", "/etc", "/Library", "/var", "/private"].contains(where: { s.hasPrefix($0) }) { return .root }
+        return nil
+    }
+
+    private func folderFilterStatus(_ filter: FolderFilter) -> IndexStatus {
+        let scopes = Defaults[.searchScopes]
+        for folder in filter.folders {
+            if let volume = fuzzy.enabledVolumes.first(where: { folder.starts(with: $0) }) {
+                if fuzzy.volumesIndexing.contains(volume) { return .indexing }
+                if fuzzy.volumeEngines[volume] == nil { return .notIndexed }
+                continue
+            }
+            if let scope = scopeForFolder(folder) {
+                if !scopes.contains(scope) { return .notIndexed }
+                if fuzzy.scopeEngines[scope] == nil {
+                    return fuzzy.indexing ? .indexing : .notIndexed
+                }
+            }
+        }
+        return .indexed
+    }
+
+    private func statusSuffix(_ status: IndexStatus) -> String {
+        switch status {
+        case .indexed: ""
+        case .indexing: " [Indexing...]"
+        case .notIndexed: " [Not indexed]"
+        case .disconnected: " [Disconnected]"
+        }
+    }
+
     private func filterItem(_ filter: FilePath, key: Character?) -> some View {
-        (
-            Text((filter == .root ? (filter.url.volumeName ?? "Root") : filter.name.string) + "\n") +
-                Text(filter == .root ? "/" : filter.shellString)
+        let status = volumeStatus(filter)
+        let subtitle: String = switch status {
+        case .notIndexed: "Click to start indexing"
+        case .indexing: "Indexing in progress..."
+        case .indexed: filter == .root ? "/" : filter.shellString
+        case .disconnected: "Volume not connected, searching cached index"
+        }
+        return (
+            Text((filter == .root ? (filter.url.volumeName ?? "Root") : filter.name.string) + statusSuffix(status) + "\n") +
+                Text(subtitle)
                 .foregroundStyle(.secondary)
                 .font(.caption)
         )
         .tag(filter as FilePath?)
-        .help("Searches inside: \(filter.shellString)")
+        .help(status == .notIndexed ? "Click to start indexing \(filter.shellString)" : status == .disconnected ? "Volume not connected, searches cached index" : "Searches inside: \(filter.shellString)")
         .ifLet(key) { view, key in
             view.keyboardShortcut(KeyEquivalent(key), modifiers: [.option])
         }
         .truncationMode(.tail)
+        .disabled(status == .indexing)
     }
 
     private func filterItem(_ filter: QuickFilter) -> some View {
@@ -81,8 +142,9 @@ struct FilterPicker: View {
     }
 
     private func filterItem(_ filter: FolderFilter) -> some View {
-        (
-            Text("\(filter.id)\n") +
+        let status = folderFilterStatus(filter)
+        return (
+            Text("\(filter.id)\(statusSuffix(status))\n") +
                 Text(filter.folders.map(\.shellString).joined(separator: ", "))
                 .foregroundStyle(.secondary)
                 .font(.caption)
@@ -93,6 +155,7 @@ struct FilterPicker: View {
             view.keyboardShortcut(KeyEquivalent(key), modifiers: [.option])
         }
         .truncationMode(.tail)
+        .disabled(status == .indexing)
     }
 
     @ViewBuilder private func filterButtons(_ filter: QuickFilter, action: String = "Edit") -> some View {
@@ -135,17 +198,6 @@ struct FilterPicker: View {
         }
     }
 
-    @ViewBuilder private var folderFilterEditMenu: some View {
-        Text("Folder filters").round(11).foregroundColor(.secondary).selectionDisabled()
-        ForEach(folderFilters, id: \.self) { filter in
-            Menu { filterButtons(filter) } label: { filterItem(filter) }
-
-            if let filter = fuzzy.folderFilter, !folderFilters.contains(filter) {
-                Divider()
-                Menu { filterButtons(filter, action: "Save") } label: { filterItem(filter) }
-            }
-        }
-    }
     @ViewBuilder
     private var quickFilterPicker: some View {
         if !quickFilters.isEmpty || fuzzy.quickFilter != nil {
@@ -162,18 +214,6 @@ struct FilterPicker: View {
             } label: { Text("Quick filter") }
                 .labelsHidden()
                 .pickerStyle(.inline)
-        }
-    }
-
-    @ViewBuilder private var quickFilterEditMenu: some View {
-        Text("Quick filters").round(11).foregroundColor(.secondary).selectionDisabled()
-        ForEach(quickFilters, id: \.self) { filter in
-            Menu { filterButtons(filter) } label: { filterItem(filter) }
-        }
-
-        if let filter = fuzzy.quickFilter, !quickFilters.contains(filter) {
-            Divider()
-            Menu { filterButtons(filter, action: "Save") } label: { filterItem(filter) }
         }
     }
 

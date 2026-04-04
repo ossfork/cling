@@ -368,6 +368,20 @@ final class SearchEngine: @unchecked Sendable {
 
     var count: Int { lock.withLock { entries.count - free.count } }
 
+    // MARK: - FTS Filesystem Walker
+
+    /// Build a set of file extension patterns from an ignore file (patterns like "*.pyc", "*.o")
+    static func extractExtensionPatterns(from ignoreContent: String) -> Set<String> {
+        var exts = Set<String>()
+        for line in ignoreContent.components(separatedBy: .newlines) {
+            let p = line.trimmingCharacters(in: .whitespaces)
+            if p.hasPrefix("*."), !p.contains("/"), p.dropFirst(2).allSatisfy({ $0 != "*" }) {
+                exts.insert(String(p.dropFirst(1))) // keep the dot: ".pyc"
+            }
+        }
+        return exts
+    }
+
     // MARK: - Capacity
 
     func reserveCapacity(_ n: Int, avgPathLen: Int = 50) {
@@ -1018,7 +1032,7 @@ final class SearchEngine: @unchecked Sendable {
         defer { Darwin.free(cDir) }
         var paths: [UnsafeMutablePointer<CChar>?] = [cDir, nil]
 
-        let opts = Int32(FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV)
+        let opts = Int32(FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV | FTS_NOSTAT)
         guard let ftsp = fts_open(&paths, opts, nil) else {
             slog.error("walkDirectory: fts_open failed for \(dir)")
             return 0
@@ -1083,7 +1097,7 @@ final class SearchEngine: @unchecked Sendable {
                 batch.append((fullPath, true))
                 added &+= 1
 
-            case FTS_F, FTS_SL, FTS_SLNONE:
+            case FTS_F, FTS_SL, FTS_SLNONE, FTS_NSOK:
                 // Skip .DS_Store, .localized, Icon\r
                 let nameLen = Int(ent.pointee.fts_namelen)
                 let n = ent.pointee.fts_path!.advanced(by: pathLen &- nameLen)
@@ -1359,6 +1373,7 @@ final class SearchEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let n = entries.count
+        guard n > 0 else { return [] }
 
         let qTrimmed = query.trimmingCharacters(in: .whitespaces)
         let wantDir = qTrimmed.hasSuffix("/")
@@ -2411,20 +2426,6 @@ final class SearchEngine: @unchecked Sendable {
             k &+= 1
         }
         return h
-    }
-
-    // MARK: - FTS Filesystem Walker
-
-    /// Build a set of file extension patterns from an ignore file (patterns like "*.pyc", "*.o")
-    private static func extractExtensionPatterns(from ignoreContent: String) -> Set<String> {
-        var exts = Set<String>()
-        for line in ignoreContent.components(separatedBy: .newlines) {
-            let p = line.trimmingCharacters(in: .whitespaces)
-            if p.hasPrefix("*."), !p.contains("/"), p.dropFirst(2).allSatisfy({ $0 != "*" }) {
-                exts.insert(String(p.dropFirst(1))) // keep the dot: ".pyc"
-            }
-        }
-        return exts
     }
 
     /// Binary search: first index in sorted where path >= prefix

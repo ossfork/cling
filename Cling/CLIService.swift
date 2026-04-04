@@ -1,3 +1,4 @@
+import Defaults
 import Foundation
 import Lowtech
 import os.log
@@ -206,12 +207,12 @@ final class SearchCoordinator: @unchecked Sendable {
 // MARK: - IPC Message Types (must match ClingCLI side)
 
 let CLING_PORT_ID = "com.lowtechguys.Cling.cli"
-let CLING_SOCKET_PORT: UInt16 = 29055
 
 enum ClingCommand: String, Codable {
     case search
     case index // backwards compat
     case reindex
+    case cancelIndex
     case status
     case recents
     case indexAdd
@@ -255,13 +256,12 @@ private extension Decodable {
     static func from(_ data: Data) -> Self? { try? JSONDecoder().decode(Self.self, from: data) }
 }
 
-// MARK: - Mach Port & Socket Listeners
+// MARK: - Mach Port Listener
 
 @MainActor
 extension FuzzyClient {
     func startCLIListeners() {
         startMachPortListener()
-        startSocketListener()
     }
 
     private func startMachPortListener() {
@@ -292,63 +292,6 @@ extension FuzzyClient {
         }
         cliMachPortThread?.name = "ClingMachPort"
         cliMachPortThread?.start()
-    }
-
-    private func startSocketListener() {
-        let coord = searchCoordinator
-        cliSocketThread = Thread {
-            let fd = socket(AF_INET, SOCK_STREAM, 0)
-            guard fd >= 0 else { cliLog.error("socket() failed"); return }
-            var yes: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
-
-            var addr = sockaddr_in()
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = CLING_SOCKET_PORT.bigEndian
-            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-            let bindOK = withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
-            }
-            guard bindOK == 0 else {
-                cliLog.error("bind() failed on port \(CLING_SOCKET_PORT): \(String(cString: strerror(errno)))")
-                return
-            }
-            guard listen(fd, 5) == 0 else { cliLog.error("listen() failed"); return }
-            cliLog.info("Socket listener started on port \(CLING_SOCKET_PORT)")
-
-            while true {
-                var clientAddr = sockaddr_in()
-                var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-                let clientFD = withUnsafeMutablePointer(to: &clientAddr) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(fd, $0, &clientLen) }
-                }
-                guard clientFD >= 0 else { continue }
-
-                var buf = [UInt8](repeating: 0, count: 4096)
-                let n = read(clientFD, &buf, buf.count)
-                guard n > 0 else { close(clientFD); continue }
-
-                let raw = String(bytes: buf[0 ..< n], encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-                if raw.isEmpty {
-                    let msg = "echo 'query' | nc localhost \(CLING_SOCKET_PORT)\n"
-                    _ = msg.withCString { write(clientFD, $0, strlen($0)) }
-                } else {
-                    let request = ClingRequest(command: .search, query: raw, maxResults: 30)
-                    let response = FuzzyClient.handleCLIRequest(request, coordinator: coord)
-                    let text: String = if let results = response.results {
-                        results.map { r in r.isDir ? r.path + "/" : r.path }.joined(separator: "\n") + "\n"
-                    } else {
-                        response.error ?? "(no results)\n"
-                    }
-                    _ = text.withCString { write(clientFD, $0, strlen($0)) }
-                }
-                close(clientFD)
-            }
-        }
-        cliSocketThread?.name = "ClingSocket"
-        cliSocketThread?.start()
     }
 
     // MARK: - Request Handler
@@ -399,12 +342,77 @@ extension FuzzyClient {
             let scopeLabel = labels.isEmpty ? "all" : labels.joined(separator: ", ")
             return ClingResponse(status: "indexing started (\(scopeLabel))", indexCount: coord.count)
 
+        case .cancelIndex:
+            let volumePaths = request.paths?.compactMap(\.filePath) ?? []
+            let cancelScopes = request.scopes != nil
+            mainActor {
+                if !volumePaths.isEmpty {
+                    for volume in volumePaths {
+                        FUZZY.cancelVolumeIndexing(volume: volume)
+                    }
+                } else if cancelScopes {
+                    FUZZY.cancelScopeIndexing()
+                } else {
+                    FUZZY.cancelAllIndexing()
+                }
+            }
+            let what = !volumePaths.isEmpty ? volumePaths.map(\.name.string).joined(separator: ", ") : cancelScopes ? "scopes" : "all"
+            return ClingResponse(status: "cancelled indexing (\(what))", indexCount: coord.count)
+
         case .status:
             let c = coord.count
-            return ClingResponse(
-                status: coord.indexing ? "indexing..." : (c > 0 ? "ready" : "empty"),
-                indexCount: c
-            )
+            var details = ""
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.main.async {
+                defer { sem.signal() }
+                var lines = [String]()
+
+                // Overall status
+                let state = FUZZY.indexing ? "indexing" : FUZZY.backgroundIndexing ? "background indexing" : (c > 0 ? "ready" : "empty")
+                lines.append("status: \(state)")
+                lines.append("total: \(c.formatted()) entries")
+
+                // Scope details
+                let enabledScopes = Defaults[.searchScopes]
+                lines.append("")
+                lines.append("scopes:")
+                for scope in SearchScope.allCases {
+                    let enabled = enabledScopes.contains(scope)
+                    let count = FUZZY.scopeEngines[scope]?.count ?? 0
+                    let indexed = FUZZY.scopeEngines[scope] != nil
+                    let status = !enabled ? "disabled" : !indexed ? (FUZZY.indexing ? "indexing..." : "not indexed") : "\(count.formatted()) entries"
+                    lines.append("  \(scope.label): \(status)")
+                }
+
+                // Volume details
+                if !FUZZY.externalVolumes.isEmpty {
+                    lines.append("")
+                    lines.append("volumes:")
+                    for volume in FUZZY.externalVolumes {
+                        let enabled = FUZZY.enabledVolumes.contains(volume)
+                        let indexing = FUZZY.volumesIndexing.contains(volume)
+                        let count = FUZZY.volumeEngines[volume]?.count ?? 0
+                        let indexed = FUZZY.volumeEngines[volume] != nil
+                        let status = !enabled ? "disabled" : indexing ? "indexing..." : !indexed ? "not indexed" : "\(count.formatted()) entries"
+                        lines.append("  \(volume.name.string) (\(volume.shellString)): \(status)")
+                    }
+                }
+
+                // Current operation
+                if !FUZZY.operation.isEmpty {
+                    lines.append("")
+                    lines.append("operation: \(FUZZY.operation)")
+                }
+
+                details = lines.joined(separator: "\n")
+            }
+            if sem.wait(timeout: .now() + 5) == .timedOut {
+                return ClingResponse(
+                    status: coord.indexing ? "indexing..." : (c > 0 ? "ready" : "empty"),
+                    indexCount: c
+                )
+            }
+            return ClingResponse(status: details, indexCount: c)
 
         case .recents:
             let maxResults = request.maxResults ?? 50

@@ -108,9 +108,6 @@ class AppDelegate: LowtechProAppDelegate {
         FUZZY.start()
         setupCleanup()
 
-        // Setup periodic relaunch timer
-        scheduleRelaunchTimer(interval: 12 * HOUR_FACTOR) // 12 hours in seconds
-
         if !SWIFTUI_PREVIEW {
             paddleVendorID = "122873"
             paddleAPIKey = "e1e517a68c1ed1bea2ac968a593ac147"
@@ -211,12 +208,10 @@ class AppDelegate: LowtechProAppDelegate {
         }
 //        log.debug("Became active")
         focusWindow()
-        // If relaunch was postponed and now window is visible, cancel postponement
-        relaunchPostponedUntil = nil
     }
 
     override func applicationDidResignActive(_ notification: Notification) {
-//        log.debug("Resigned active")
+        log.debug("Resigned active: pinned=\(WM.pinned) keepOpen=\(Defaults[.keepWindowOpenWhenDefocused]) settingsVisible=\(settingsWindow?.isVisible ?? false)")
         let settingsVisible = settingsWindow?.isVisible ?? false
         if !Defaults[.keepWindowOpenWhenDefocused], !settingsVisible {
             settingsWindow?.close()
@@ -228,10 +223,14 @@ class AppDelegate: LowtechProAppDelegate {
         guard !Defaults[.keepWindowOpenWhenDefocused], !settingsVisible else {
             return
         }
+
+        if NSApp.isActive {
+            log.debug("Skipping window close: app became active again")
+            return
+        }
+        log.debug("Closing main window after resign delay")
         WM.mainWindowActive = false
         mainWindow?.close()
-        // If relaunch was postponed and window is now not visible, check if we should relaunch
-        checkAndRelaunchIfNeeded()
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -316,14 +315,32 @@ class AppDelegate: LowtechProAppDelegate {
             WM.mainWindowActive = false
             APP_MANAGER.lastFrontmostApp?.activate()
 
-            // If relaunch was already postponed, push another 5 minutes to avoid quitting just after window close
-            if relaunchPostponedUntil != nil {
-                postponeRelaunch(by: 5 * MINUTE_FACTOR, reason: "after window close")
-            }
         }
     }
     @objc func windowDidBecomeMain(_ notification: Notification) {
-        if let window = notification.object as? NSWindow, window.title == "Cling" {
+        guard let window = notification.object as? NSWindow else { return }
+
+        if let paddleController = window.windowController as? PADActivateWindowController,
+           let email = paddleController.emailTxt, let licenseCode = paddleController.licenseTxt
+        {
+            email.isBordered = true
+            licenseCode.isBordered = true
+
+            email.drawsBackground = true
+            licenseCode.drawsBackground = true
+
+            email.backgroundColor = .black.withAlphaComponent(0.05)
+            licenseCode.backgroundColor = .black.withAlphaComponent(0.05)
+        }
+
+        if window.title.contains("Settings"), !settingsWindowConfigured {
+            settingsWindowConfigured = true
+            window.titlebarAppearsTransparent = true
+            window.backgroundColor = .clear
+            window.toolbar?.showsBaselineSeparator = false
+        }
+
+        if window.title == "Cling" {
             WM.mainWindowActive = true
             FUZZY.refreshDefaultResultsIfNeeded()
 
@@ -356,51 +373,9 @@ class AppDelegate: LowtechProAppDelegate {
     }
 
     private var windowConfigured = false
-
-    private var relaunchTimer: Timer?
-    private var relaunchPostponedUntil: Date?
+    private var settingsWindowConfigured = false
 
     private var resizeCancellable: AnyCancellable?
-
-    // MARK: Relaunch Logic
-
-    private func scheduleRelaunchTimer(interval: TimeInterval) {
-        relaunchTimer?.invalidate()
-        relaunchTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { _ in
-            mainActor { self.attemptRelaunch() }
-        }
-    }
-
-    private func postponeRelaunch(by interval: TimeInterval, reason: String? = nil) {
-        relaunchPostponedUntil = Date().addingTimeInterval(interval)
-        scheduleRelaunchTimer(interval: interval)
-        if let reason { debug("Relaunch postponed by \(interval) seconds: \(reason)") }
-    }
-
-    private func attemptRelaunch() {
-        if WM.mainWindowActive {
-            postponeRelaunch(by: 30 * MINUTE_FACTOR, reason: "after window is active")
-        } else {
-            debug("Relaunching app")
-            relaunchApp()
-        }
-    }
-
-    private func checkAndRelaunchIfNeeded() {
-        if let postponed = relaunchPostponedUntil, Date() >= postponed {
-            debug("Relaunching app after inactivity")
-            relaunchApp()
-        }
-    }
-
-    private func relaunchApp() {
-        cleanup()
-        _ = shell(
-            command: "while /bin/ps -o pid -p \(ProcessInfo.processInfo.processIdentifier) >/dev/null 2>/dev/null; do /bin/sleep 0.1; done; /bin/sleep 0.5; /usr/bin/open '\(Bundle.main.bundlePath)' --args --hidden",
-            wait: false
-        )
-        exit(0)
-    }
 
 }
 
@@ -455,22 +430,26 @@ func batteryLevel() -> Double {
 }
 
 struct WindowBackground: View {
+    var tintColor: Color {
+        colorScheme == .light ? .white : .black
+    }
+
     var body: some View {
         switch appearance {
         case .glassy:
             if #available(macOS 26, *) {
                 let lightOpacity: Double = colorScheme == .light ? 0.7 : 0.5
-                Color(.windowBackgroundColor).opacity(lightOpacity)
+                tintColor.opacity(lightOpacity)
                     .background(Color.clear.glassEffect(.regular, in: .rect))
             } else {
                 let lightOpacity: Double = colorScheme == .light ? 0.4 : 0.5
-                Color(.windowBackgroundColor).opacity(lightOpacity)
-                    .background(.ultraThickMaterial)
+                tintColor.opacity(lightOpacity)
+                    .background(.regularMaterial)
             }
         case .vibrant:
             let lightOpacity: Double = colorScheme == .light ? 0.4 : 0.5
-            Color(.windowBackgroundColor).opacity(lightOpacity)
-                .background(.ultraThickMaterial)
+            tintColor.opacity(lightOpacity)
+                .background(.regularMaterial)
         case .opaque:
             Color(.windowBackgroundColor)
         }
@@ -522,8 +501,11 @@ struct ClingApp: App {
 
         Window("Welcome to Cling", id: "onboarding") {
             OnboardingView()
+                .background { WindowBackground() }
+                .ignoresSafeArea()
                 .environmentObject(envState)
         }
+        .defaultSize(width: 560, height: 580)
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
 
@@ -531,6 +513,7 @@ struct ClingApp: App {
             SettingsView()
                 .frame(minWidth: 600, minHeight: 600)
                 .environmentObject(envState)
+                .glassOrMaterial(cornerRadius: 0)
         }
         .defaultSize(width: 600, height: 600)
     }

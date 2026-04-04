@@ -10,6 +10,7 @@ import Lowtech
 import LowtechPro
 import SwiftUI
 import System
+import UniformTypeIdentifiers
 
 extension Int {
     var humanSize: String {
@@ -50,6 +51,8 @@ struct ContentView: View {
                 Image(systemName: wm.pinned ? "pin.circle.fill" : "pin.circle")
                 Text(wm.pinned ? "Unpin" : "Pin")
             }
+            .padding(4)
+            .contentShape(Rectangle())
         }
         .font(.round(10))
         .buttonStyle(.plain)
@@ -70,6 +73,8 @@ struct ContentView: View {
                 Image(systemName: "xmark.circle.fill")
                 Text("Quit")
             }
+            .padding(4)
+            .contentShape(Rectangle())
         }
         .font(.round(10))
         .buttonStyle(.plain)
@@ -168,6 +173,11 @@ struct ContentView: View {
                     fullHistoryList
                 } else {
                     resultsListWithKeys
+                        .overlay {
+                            if let volume = fuzzy.volumeFilter, fuzzy.volumesIndexing.contains(volume) {
+                                volumeIndexingOverlay(volume)
+                            }
+                        }
                 }
 
                 if wm.mainWindowActive {
@@ -223,23 +233,49 @@ struct ContentView: View {
     }
 
     private var activityLogList: some View {
-        List(fuzzy.activityLog.reversed()) { entry in
-            HStack {
-                Text(entry.message)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .textSelection(.enabled)
-                Spacer()
-                if let ms = entry.durationMs {
-                    Text(ms >= 1000 ? String(format: "%.1fs", ms / 1000) : String(format: "%.0fms", ms))
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .padding(.trailing, 4)
+        List {
+            ForEach(fuzzy.ongoingOperationsList, id: \.key) { op in
+                Button {
+                    if op.key.hasPrefix("scope:") {
+                        fuzzy.cancelScopeIndexing()
+                    } else if op.key.hasPrefix("volume:") {
+                        let path = String(op.key.dropFirst("volume:".count))
+                        fuzzy.cancelVolumeIndexing(volume: FilePath(path))
+                    } else {
+                        fuzzy.cancelAllIndexing()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text(op.message)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer()
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
                 }
-                Text(entry.date.formatted(.dateTime.hour().minute().second()))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
+                .buttonStyle(.plain)
+            }
+            ForEach(fuzzy.activityLog.reversed()) { entry in
+                HStack {
+                    Text(entry.message)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .textSelection(.enabled)
+                    Spacer()
+                    if let ms = entry.durationMs {
+                        Text(ms >= 1000 ? String(format: "%.1fs", ms / 1000) : String(format: "%.0fms", ms))
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .padding(.trailing, 4)
+                    }
+                    Text(entry.date.formatted(.dateTime.hour().minute().second()))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
         .raisedPanel()
@@ -388,6 +424,24 @@ struct ContentView: View {
             .padding(.leading, FilterPicker.iconWidth + 8)
             .allowsHitTesting(true)
         }
+    }
+
+    private func volumeIndexingOverlay(_ volume: FilePath) -> some View {
+        VStack(spacing: 8) {
+            ProgressView()
+                .progressViewStyle(CircularProgressViewStyle())
+            Text("Indexing \(volume.name.string)...")
+                .medium(20)
+                .foregroundStyle(.secondary)
+            if !fuzzy.operation.isEmpty {
+                Text(fuzzy.operation)
+                    .round(12, weight: .regular)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .fill()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
     private var fullDiskAccessOverlay: some View {
@@ -1004,6 +1058,26 @@ class FilePathBackgroundTasks {
         guard force || (attrCache[path] == nil && (attrFetchers[path]?.isCancelled ?? true)) else { return }
         attrFetchers[path]?.cancel()
 
+        // Check SMB metadata cache for instant size/date without network round trip
+        if let volume = path.volume,
+           let smbCache = FUZZY.smbMetadataCaches[volume],
+           let meta = smbCache.get(path.string)
+        {
+            attrCache[path] = [:]
+
+            let date = meta.modificationDate
+            path.cache(date.formatted(dateFormat), forKey: \FilePath.formattedModificationDate)
+            path.cache(date.iso8601String, forKey: \FilePath.isoFormattedModificationDate)
+            path.cache(date, forKey: \FilePath.date)
+
+            let size = Int(meta.size)
+            path.cache(size.humanSize, forKey: \FilePath.humanizedFileSize)
+            path.cache(size, forKey: \FilePath.size)
+
+            FUZZY.reloadResults()
+            return
+        }
+
         let fetcher = DispatchWorkItem {
             let attrs: [FileAttributeKey: Any]
             let icon: NSImage
@@ -1045,7 +1119,13 @@ class FilePathBackgroundTasks {
 
 @MainActor
 extension FilePath {
+    private var smbMeta: SMBFileMetadata? {
+        guard let volume else { return nil }
+        return FUZZY.smbMetadataCaches[volume]?.get(string)
+    }
+
     var date: Date {
+        if let meta = smbMeta { return meta.modificationDate }
         guard !memoz.isOnExternalVolume else {
             FilePathBackgroundTasks.shared.fetchAttributes(of: self)
             return Date()
@@ -1053,6 +1133,7 @@ extension FilePath {
         return modificationDate ?? Date()
     }
     var formattedModificationDate: String {
+        if let meta = smbMeta { return meta.modificationDate.formatted(dateFormat) }
         guard !memoz.isOnExternalVolume else {
             FilePathBackgroundTasks.shared.fetchAttributes(of: self)
             return "Fetching..."
@@ -1060,6 +1141,7 @@ extension FilePath {
         return (modificationDate ?? Date()).formatted(dateFormat)
     }
     var isoFormattedModificationDate: String {
+        if let meta = smbMeta { return meta.modificationDate.iso8601String }
         guard !memoz.isOnExternalVolume else {
             FilePathBackgroundTasks.shared.fetchAttributes(of: self)
             return "Fetching..."
@@ -1068,6 +1150,7 @@ extension FilePath {
     }
 
     var size: Int {
+        if let meta = smbMeta { return Int(meta.size) }
         guard !memoz.isOnExternalVolume else {
             FilePathBackgroundTasks.shared.fetchAttributes(of: self)
             return 0
@@ -1076,6 +1159,7 @@ extension FilePath {
     }
 
     var humanizedFileSize: String {
+        if let meta = smbMeta { return Int(meta.size).humanSize }
         guard !memoz.isOnExternalVolume else {
             FilePathBackgroundTasks.shared.fetchAttributes(of: self)
             return "—"
@@ -1083,8 +1167,15 @@ extension FilePath {
         return (fileSize() ?? 0).humanSize
     }
     var icon: NSImage {
-        guard !memoz.isOnExternalVolume else {
-            return NSWorkspace.shared.icon(for: memoz.isDir ? .volume : .plainText)
+        if memoz.isOnExternalVolume {
+            if memoz.isDir {
+                return NSWorkspace.shared.icon(for: .folder)
+            }
+            let ext = url.pathExtension
+            if !ext.isEmpty, let utType = UTType(filenameExtension: ext) {
+                return NSWorkspace.shared.icon(for: utType)
+            }
+            return NSWorkspace.shared.icon(for: .plainText)
         }
         return NSWorkspace.shared.icon(forFile: string)
     }

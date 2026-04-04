@@ -9,6 +9,7 @@ enum ClingCommand: String, Codable {
     case search
     case index // backwards compat
     case reindex
+    case cancelIndex
     case status
     case recents
     case indexAdd
@@ -226,11 +227,17 @@ struct Reindex: ParsableCommand {
         clears the in-memory index, and re-walks the entire filesystem from scratch. \
         This is useful when the index is corrupted or after significant changes to \
         the ignore file or blocklist.
+
+        With --cancel, stops any ongoing indexing. Combine with --scope to cancel \
+        specific scopes or volumes only.
         """
     )
 
     @Flag(name: .shortAndLong, help: "Force full rebuild: delete persisted indexes and re-walk from scratch")
     var rebuild = false
+
+    @Flag(name: .shortAndLong, help: "Cancel ongoing indexing instead of starting a new one")
+    var cancel = false
 
     @Flag(name: .shortAndLong, help: "Wait for indexing to finish")
     var wait = false
@@ -241,7 +248,8 @@ struct Reindex: ParsableCommand {
     mutating func run() throws {
         let volumes = scope.filter { $0.hasPrefix("/Volumes/") || $0.hasPrefix("/Volumes") }
         let scopes = scope.filter { !$0.hasPrefix("/Volumes") }
-        let request = ClingRequest(command: .reindex, rebuild: rebuild, scopes: scopes.isEmpty && volumes.isEmpty ? nil : scopes, paths: volumes.isEmpty ? nil : volumes)
+        let command: ClingCommand = cancel ? .cancelIndex : .reindex
+        let request = ClingRequest(command: command, rebuild: rebuild, scopes: scopes.isEmpty && volumes.isEmpty ? nil : scopes, paths: volumes.isEmpty ? nil : volumes)
         guard let data = try sendMachPort(data: JSONEncoder().encode(request), recvTimeout: 300) else {
             fputs("error: no response from Cling app\n", stderr)
             throw ExitCode.failure
@@ -295,8 +303,7 @@ struct Status: ParsableCommand {
         }
         if let error = response.error { fputs("error: \(error)\n", stderr) }
         else {
-            print("indexed: \(response.indexCount ?? 0) entries")
-            print("status: \(response.status ?? "unknown")")
+            print(response.status ?? "unknown")
         }
     }
 }

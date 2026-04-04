@@ -96,6 +96,14 @@ enum SortField: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private func computeEnabledVolumes(mounted: [FilePath], disabled: [FilePath]) -> [FilePath] {
+    let disabledSet = Set(disabled)
+    let mountedSet = Set(mounted)
+    let mountedEnabled = mounted.filter { !disabledSet.contains($0) }
+    let disconnected = Defaults[.indexedVolumePaths].filter { !mountedSet.contains($0) && !disabledSet.contains($0) }
+    return mountedEnabled + disconnected
+}
+
 @Observable @MainActor
 class FuzzyClient {
     init() {}
@@ -164,10 +172,13 @@ class FuzzyClient {
     var searching = false
     var hasFullDiskAccess: Bool = FullDiskAccess.isGranted
     var disabledVolumes: [FilePath] = Defaults[.disabledVolumes]
-    var enabledVolumes: [FilePath] = initialVolumes.filter { !Defaults[.disabledVolumes].contains($0) }
-    var externalIndexes: [FilePath] = initialVolumes
-        .filter { !Defaults[.disabledVolumes].contains($0) }
+    var enabledVolumes: [FilePath] = computeEnabledVolumes(mounted: initialVolumes, disabled: Defaults[.disabledVolumes])
+    var externalIndexes: [FilePath] = computeEnabledVolumes(mounted: initialVolumes, disabled: Defaults[.disabledVolumes])
         .map { volumeIndexFile($0) }
+    var disconnectedVolumes: Set<FilePath> = {
+        let mounted = Set(initialVolumes)
+        return Set(Defaults[.indexedVolumePaths].filter { !mounted.contains($0) && !Defaults[.disabledVolumes].contains($0) })
+    }()
 
     var readOnlyVolumes: [FilePath] = initialVolumes.filter(\.url.volumeIsReadOnly)
     @ObservationIgnored var quickFilterPool: [Int]? // Legacy, for CLI
@@ -176,33 +187,56 @@ class FuzzyClient {
 
     var suspended = false
 
-    @ObservationIgnored var volumeIndexTask: Task<Void, Never>?
+    @ObservationIgnored var scopeIndexTask: Task<Void, Never>?
+    @ObservationIgnored var volumeIndexTasks: [FilePath: Task<Void, Never>] = [:]
+    var volumesIndexing: Set<FilePath> = []
     @ObservationIgnored var cliMachPortThread: Thread?
-    @ObservationIgnored var cliSocketThread: Thread?
 
     // MARK: - Search Engines (per-scope + recents)
 
     /// Per-scope engines: each scope has its own SearchEngine for independent search/load/unload
     @ObservationIgnored var scopeEngines: [SearchScope: SearchEngine] = [:]
     @ObservationIgnored var volumeEngines: [FilePath: SearchEngine] = [:]
+    @ObservationIgnored var smbMetadataCaches: [FilePath: SMBMetadataCache] = [:]
     @ObservationIgnored var recentsEngine = SearchEngine()
 
     @ObservationIgnored var suppressNextSearch = false
     @ObservationIgnored let fsEventsQueue = DispatchQueue(label: "com.lowtechguys.Cling.fsevents")
 
+    @ObservationIgnored var updatingFilters = false
     @ObservationIgnored var defaultResultsDirty = true
 
     @ObservationIgnored var fsignoreWatchSuppressedUntil: CFAbsoluteTime = 0
 
+    /// Log an activity with optional duration tracking.
+    /// Call with a key to start timing, call again with the same key to log with duration.
+    /// Log an activity. Set `ongoing: true` for operations in progress (shows spinner).
+    /// Set `ongoing: false` (default) for completed operations (clears spinner after logging).
+    @ObservationIgnored var ongoingOperations: [String: String] = [:]
+    var ongoingOperationsList: [(key: String, message: String)] = []
+
     var backgroundIndexing = false {
-        didSet { searchCoordinator.setIndexing(indexing || backgroundIndexing) }
+        didSet {
+            if !backgroundIndexing, !indexing {
+                ongoingOperations.removeAll()
+                setOperation("")
+            }
+            searchCoordinator.setIndexing(indexing || backgroundIndexing)
+        }
     }
 
     var quickFilter: QuickFilter? {
         didSet {
-            guard quickFilter != oldValue else { return }
+            guard quickFilter != oldValue, !updatingFilters else { return }
+            updatingFilters = true
+            defer { updatingFilters = false }
+
             if let quickFilter {
                 logActivity("QuickFilter: \(quickFilter.id)")
+                // Deselect folder filter unless quick filter has its own folders
+                if quickFilter.folders == nil || quickFilter.folders?.isEmpty == true {
+                    if folderFilter != nil { folderFilter = nil }
+                }
             } else {
                 logActivity("QuickFilter cleared")
             }
@@ -241,7 +275,9 @@ class FuzzyClient {
     }
 
     var externalVolumes: [FilePath] = initialVolumes { didSet {
-        enabledVolumes = externalVolumes.filter { !disabledVolumes.contains($0) }
+        let mounted = Set(externalVolumes)
+        disconnectedVolumes = Set(Defaults[.indexedVolumePaths].filter { !mounted.contains($0) && !disabledVolumes.contains($0) })
+        enabledVolumes = computeEnabledVolumes(mounted: externalVolumes, disabled: disabledVolumes)
         readOnlyVolumes = externalVolumes.filter(\.url.volumeIsReadOnly)
         externalIndexes = getExternalIndexes()
         indexStaleExternalVolumes()
@@ -249,25 +285,46 @@ class FuzzyClient {
 
     var volumeFilter: FilePath? {
         didSet {
-            guard volumeFilter != oldValue else { return }
+            guard volumeFilter != oldValue, !updatingFilters else { return }
+            updatingFilters = true
+            defer { updatingFilters = false }
+
             if let volumeFilter {
+                // Auto-start indexing if not yet indexed
+                if volumeFilter != .root, volumeEngines[volumeFilter] == nil, !volumesIndexing.contains(volumeFilter) {
+                    indexVolume(volumeFilter)
+                }
                 logActivity("Volume filter: \(volumeFilter.name.string)")
+                if folderFilter != nil { folderFilter = nil }
             } else {
                 logActivity("Volume filter cleared")
             }
+            // Skip search if volume is not yet indexed
+            guard volumeFilter == nil || volumeFilter == .root || volumeEngines[volumeFilter!] != nil else { return }
             performSearch()
         }
     }
     var folderFilter: FolderFilter? {
         didSet {
-            guard folderFilter != oldValue else { return }
+            guard folderFilter != oldValue, !updatingFilters else { return }
+            updatingFilters = true
+            defer { updatingFilters = false }
+
             if let folderFilter {
                 logActivity("Folder filter: \(folderFilter.id)")
+                // Deselect volume filter
+                if volumeFilter != nil { volumeFilter = nil }
+                // Merge folders into active quick filter, keeping non-folder properties
+                if let currentQuick = quickFilter {
+                    quickFilter = QuickFilter(
+                        id: currentQuick.id, extensions: currentQuick.extensions,
+                        preQuery: currentQuick.preQuery, postQuery: currentQuick.postQuery,
+                        dirsOnly: currentQuick.dirsOnly, folders: folderFilter.folders, key: currentQuick.key
+                    )
+                    recomputeQuickFilterPool()
+                }
             } else if quickFilter == nil {
                 logActivity("Folder filter cleared")
-            }
-            if let folderFilter, let volumeFilter, !folderFilter.folders.allSatisfy({ $0.starts(with: volumeFilter) }) {
-                self.volumeFilter = nil
             }
             if folderFilter == nil, quickFilter == nil {
                 filteredSubsetCount = nil
@@ -303,8 +360,12 @@ class FuzzyClient {
     }
     var indexing = false {
         didSet {
-            if !indexing { setOperation("") }
-            else { setOperation("Indexing files") }
+            if !indexing, !backgroundIndexing {
+                ongoingOperations.removeAll()
+                setOperation("")
+            } else if indexing {
+                setOperation("Indexing files")
+            }
             searchCoordinator.setIndexing(indexing || backgroundIndexing)
         }
     }
@@ -396,6 +457,7 @@ class FuzzyClient {
             _operationThrottle?.cancel()
             _operationThrottle = nil
             operation = value
+            ongoingOperationsList = []
             _lastOperationUpdate = CFAbsoluteTimeGetCurrent()
             return
         }
@@ -405,6 +467,7 @@ class FuzzyClient {
             _operationThrottle?.cancel()
             _operationThrottle = nil
             operation = value
+            ongoingOperationsList = ongoingOperations.map { (key: $0.key, message: $0.value) }
             _lastOperationUpdate = now
         } else {
             _operationThrottle?.cancel()
@@ -412,16 +475,13 @@ class FuzzyClient {
                 try? await Task.sleep(for: .milliseconds(Int(500 - elapsed * 1000)))
                 guard !Task.isCancelled else { return }
                 self.operation = value
+                self.ongoingOperationsList = self.ongoingOperations.map { (key: $0.key, message: $0.value) }
                 self._lastOperationUpdate = CFAbsoluteTimeGetCurrent()
                 self._operationThrottle = nil
             }
         }
     }
-    /// Log an activity with optional duration tracking.
-    /// Call with a key to start timing, call again with the same key to log with duration.
-    /// Log an activity. Set `ongoing: true` for operations in progress (shows spinner).
-    /// Set `ongoing: false` (default) for completed operations (clears spinner after logging).
-    func logActivity(_ message: String, ongoing: Bool = false, timerKey: String? = nil) {
+    func logActivity(_ message: String, ongoing: Bool = false, operationKey: String? = nil, timerKey: String? = nil) {
         var duration: Double?
         if let key = timerKey {
             if let start = activityTimers[key] {
@@ -435,10 +495,20 @@ class FuzzyClient {
         if activityLog.count > 100 {
             activityLog.removeFirst(activityLog.count - 100)
         }
-        if ongoing {
-            setOperation(message)
+        if ongoing, let key = operationKey {
+            ongoingOperations[key] = message
+            setOperation(compactOperationSummary())
         } else {
-            setOperation("")
+            if let key = operationKey {
+                ongoingOperations.removeValue(forKey: key)
+            }
+            if !ongoingOperations.isEmpty {
+                setOperation(compactOperationSummary())
+            } else if backgroundIndexing || indexing {
+                setOperation(message)
+            } else {
+                setOperation("")
+            }
         }
     }
     /// Sync active engines to the SearchCoordinator (for CLI thread access)
@@ -519,7 +589,9 @@ class FuzzyClient {
             .debounce(for: 2.0, scheduler: RunLoop.main)
             .sink { [self] volumes in
                 disabledVolumes = volumes.newValue
-                enabledVolumes = externalVolumes.filter { !disabledVolumes.contains($0) }
+                let mounted = Set(externalVolumes)
+                disconnectedVolumes = Set(Defaults[.indexedVolumePaths].filter { !mounted.contains($0) && !disabledVolumes.contains($0) })
+                enabledVolumes = computeEnabledVolumes(mounted: externalVolumes, disabled: disabledVolumes)
                 externalIndexes = getExternalIndexes()
                 performSearch()
             }.store(in: &observers)
@@ -677,14 +749,16 @@ class FuzzyClient {
                 let file = scopeIndexFile(scope)
                 guard file.exists else { continue }
                 let eng = SearchEngine()
+                let opKey = "load:\(scope.rawValue)"
                 if eng.loadBinaryIndex(from: file.url, progress: { count in
                     Task { @MainActor in
-                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true)
+                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true, operationKey: opKey)
                     }
                 }) {
                     await MainActor.run {
                         self.scopeEngines[scope] = eng
                         self.updateIndexedCount()
+                        self.logActivity("Loaded \(scope.label): \(eng.count.formatted()) entries", operationKey: opKey)
                     }
                 }
             }
@@ -694,28 +768,82 @@ class FuzzyClient {
                 let file = scopeIndexFile(scope)
                 guard file.exists else { continue }
                 let eng = SearchEngine()
+                let opKey = "load:\(scope.rawValue)"
                 if eng.loadBinaryIndex(from: file.url, progress: { count in
                     Task { @MainActor in
-                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true)
+                        self.logActivity("Loading \(scope.label): \(count.formatted()) entries", ongoing: true, operationKey: opKey)
                     }
                 }) {
                     await MainActor.run {
                         self.scopeEngines[scope] = eng
                         self.updateIndexedCount()
+                        self.logActivity("Loaded \(scope.label): \(eng.count.formatted()) entries", operationKey: opKey)
                     }
                 }
             }
 
-            // Phase 3: Load volume indexes
+            // Backfill indexedVolumePaths from existing index files on disk
+            let scopeNames = Set(SearchScope.allCases.map(\.rawValue))
+            let indexFiles = (try? FileManager.default.contentsOfDirectory(atPath: indexFolder.string)) ?? []
+            let discoveredVolumePaths: [FilePath] = indexFiles.compactMap { filename in
+                guard filename.hasSuffix(".idx") else { return nil }
+                let name = String(filename.dropLast(4))
+                guard !scopeNames.contains(name) else { return nil }
+                let volumeName = name.replacingOccurrences(of: "-", with: " ")
+                let volume = FilePath("/Volumes/\(volumeName)")
+                // Also try the original dashed name
+                let volumeDashed = FilePath("/Volumes/\(name)")
+                if Defaults[.disabledVolumes].contains(volume) || Defaults[.disabledVolumes].contains(volumeDashed) { return nil }
+                // Prefer the path that exists, fall back to the spaced version
+                if volumeDashed.exists { return volumeDashed }
+                return volume
+            }
+            if !discoveredVolumePaths.isEmpty {
+                let existing = Set(Defaults[.indexedVolumePaths])
+                let newPaths = discoveredVolumePaths.filter { !existing.contains($0) }
+                if !newPaths.isEmpty {
+                    await MainActor.run {
+                        Defaults[.indexedVolumePaths].append(contentsOf: newPaths)
+                        let mounted = Set(self.externalVolumes)
+                        self.disconnectedVolumes = Set(Defaults[.indexedVolumePaths].filter { !mounted.contains($0) && !self.disabledVolumes.contains($0) })
+                        self.enabledVolumes = computeEnabledVolumes(mounted: self.externalVolumes, disabled: self.disabledVolumes)
+                    }
+                }
+            }
+
+            // Phase 3: Load volume indexes (including disconnected but previously indexed volumes)
+            var missingIndexVolumes: [FilePath] = []
             for volume in await MainActor.run(body: { self.enabledVolumes }) {
                 let file = volumeIndexFile(volume)
-                guard file.exists else { continue }
+                guard file.exists else {
+                    if Defaults[.indexedVolumePaths].contains(volume) { missingIndexVolumes.append(volume) }
+                    continue
+                }
                 let eng = SearchEngine()
                 if eng.loadBinaryIndex(from: file.url) {
+                    let metaCacheFile = smbMetadataCacheFile(volume)
+                    var metaCache: SMBMetadataCache?
+                    if metaCacheFile.exists {
+                        let cache = SMBMetadataCache()
+                        cache.load(from: metaCacheFile)
+                        if cache.count > 0 { metaCache = cache }
+                    }
                     await MainActor.run {
                         self.volumeEngines[volume] = eng
+                        if let metaCache { self.smbMetadataCaches[volume] = metaCache }
                         self.updateIndexedCount()
                     }
+                }
+            }
+
+            // Clean up indexed volume paths whose index files no longer exist
+            if !missingIndexVolumes.isEmpty {
+                await MainActor.run {
+                    Defaults[.indexedVolumePaths].removeAll { missingIndexVolumes.contains($0) }
+                    for vol in missingIndexVolumes {
+                        self.disconnectedVolumes.remove(vol)
+                    }
+                    self.enabledVolumes = computeEnabledVolumes(mounted: self.externalVolumes, disabled: self.disabledVolumes)
                 }
             }
 
@@ -779,7 +907,8 @@ class FuzzyClient {
         bust_gitignore_cache()
         let ignoreChecker: String? = fsignore.exists ? fsignoreString : nil
 
-        Task.detached(priority: .userInitiated) {
+        scopeIndexTask?.cancel()
+        scopeIndexTask = Task.detached(priority: .userInitiated) {
             await withTaskGroup(of: (SearchScope, SearchEngine).self) { group in
                 for scope in scopes {
                     let dirs = await self.walkDirs(for: scope)
@@ -795,9 +924,10 @@ class FuzzyClient {
                                 return excludeSkip?(path) ?? false
                             }
                             let ignore = dir.applyIgnore ? ignoreChecker : nil
+                            let opKey = "scope:\(scope.rawValue)"
                             scopeEngine.walkDirectory(dir.dir, ignoreFile: ignore, skipDir: skipDir, progress: { count, _ in
                                 Task { @MainActor in
-                                    self.logActivity("Indexing \(scope.label): \(count.formatted()) files", ongoing: true)
+                                    self.logActivity("Indexing \(scope.label): \(count.formatted()) files", ongoing: true, operationKey: opKey)
                                 }
                             })
                         }
@@ -817,7 +947,7 @@ class FuzzyClient {
                     await MainActor.run {
                         self.scopeEngines[scope] = scopeEngine
                         self.updateIndexedCount()
-                        self.logActivity("Indexed \(scope.label): \(added.formatted()) files (\(self.indexedCount.formatted()) total)")
+                        self.logActivity("Indexed \(scope.label): \(added.formatted()) files (\(self.indexedCount.formatted()) total)", operationKey: "scope:\(scope.rawValue)")
 
                         if !searchTriggered {
                             searchTriggered = true
@@ -830,11 +960,12 @@ class FuzzyClient {
             }
 
             await MainActor.run {
+                self.scopeIndexTask = nil
                 self.cleanRecentsEngine()
                 self.excludedPaths.removeAll()
                 onFinish?()
                 self.indexing = false
-                self.backgroundIndexing = false
+                self.backgroundIndexing = !self.volumesIndexing.isEmpty
                 if !self.emptyQuery || self.volumeFilter != nil {
                     self.performSearch()
                 }
@@ -1232,16 +1363,59 @@ class FuzzyClient {
         }
 
         if !nonHomePaths.isEmpty {
-            let current = Defaults[.blockedContains]
-            let existingLines = Set(current.components(separatedBy: .newlines))
-            let newPaths = nonHomePaths.map(\.string).filter { !existingLines.contains($0) }
-            if !newPaths.isEmpty {
-                let additions = newPaths.joined(separator: "\n")
-                var updated = current
-                if !updated.hasSuffix("\n") { updated += "\n" }
-                updated += additions
-                Defaults[.blockedContains] = updated
-                PathBlocklist.shared.rebuild()
+            // Group paths by volume
+            var volumePaths: [FilePath: [FilePath]] = [:]
+            var otherPaths: [FilePath] = []
+            for path in nonHomePaths {
+                if let volume = enabledVolumes.first(where: { path.starts(with: $0) }) {
+                    volumePaths[volume, default: []].append(path)
+                } else {
+                    otherPaths.append(path)
+                }
+            }
+
+            // Write volume paths to each volume's .fsignore
+            for (volume, paths) in volumePaths {
+                let volumeFsignore = volume / ".fsignore"
+                let volumeStr = volume.string + "/"
+                let relativePaths = paths.map { path -> String in
+                    var rel = String(path.string.dropFirst(volumeStr.count))
+                    if path.isDir { rel += "/" }
+                    return rel
+                }
+                let existingLines = Set((try? String(contentsOfFile: volumeFsignore.string, encoding: .utf8))?.components(separatedBy: .newlines) ?? [])
+                let newPaths = relativePaths.filter { !existingLines.contains($0) }
+                if !newPaths.isEmpty {
+                    let fileList = newPaths.joined(separator: "\n")
+                    do {
+                        if !volumeFsignore.exists {
+                            FileManager.default.createFile(atPath: volumeFsignore.string, contents: nil)
+                        }
+                        let fileHandle = try FileHandle(forUpdating: volumeFsignore.url)
+                        fileHandle.seekToEndOfFile()
+                        if let data = "\n\(fileList)".data(using: .utf8) {
+                            fileHandle.write(data)
+                        }
+                        fileHandle.closeFile()
+                    } catch {
+                        log.error("Failed to write to \(volumeFsignore.string): \(error.localizedDescription)")
+                    }
+                }
+            }
+
+            // Non-volume, non-home paths go to blockedContains
+            if !otherPaths.isEmpty {
+                let current = Defaults[.blockedContains]
+                let existingLines = Set(current.components(separatedBy: .newlines))
+                let newPaths = otherPaths.map(\.string).filter { !existingLines.contains($0) }
+                if !newPaths.isEmpty {
+                    let additions = newPaths.joined(separator: "\n")
+                    var updated = current
+                    if !updated.hasSuffix("\n") { updated += "\n" }
+                    updated += additions
+                    Defaults[.blockedContains] = updated
+                    PathBlocklist.shared.rebuild()
+                }
             }
         }
 
@@ -1399,6 +1573,13 @@ class FuzzyClient {
     @ObservationIgnored private var fsignoreContentHashes: [String: Int] = [:]
     @ObservationIgnored private var fsignoreReindexTask: DispatchWorkItem?
 
+    private func compactOperationSummary() -> String {
+        let ops = Array(ongoingOperations.values)
+        guard let first = ops.last else { return "" }
+        if ops.count == 1 { return first }
+        return "\(first) (+\(ops.count - 1) more)"
+    }
+
     // MARK: - Ignore File Watching
 
     private func contentHash(of path: String) -> Int? {
@@ -1432,12 +1613,17 @@ class FuzzyClient {
 
     private func walkDirs(for scope: SearchScope) -> [(dir: String, excludePrefix: String?, applyIgnore: Bool)] {
         switch scope {
-        case .home: [(HOME.string, "\(HOME.string)/Library", true)]
-        case .library: [("\(HOME.string)/Library", nil, true)]
-        case .applications: [("/Applications", nil, false), ("/System/Applications", nil, false)]
-        case .system: [("/System", "/System/Volumes", false)]
+        case .home:
+            var dirs: [(dir: String, excludePrefix: String?, applyIgnore: Bool)] = [(HOME.string, "\(HOME.string)/Library", true)]
+            if FileManager.default.fileExists(atPath: "/Users/Shared") {
+                dirs.append(("/Users/Shared", nil, true))
+            }
+            return dirs
+        case .library: return [("\(HOME.string)/Library", nil, true)]
+        case .applications: return [("/Applications", nil, false), ("/System/Applications", nil, false)]
+        case .system: return [("/System", "/System/Volumes", false)]
         case .root:
-            ["/usr", "/bin", "/sbin", "/opt", "/etc", "/Library", "/var", "/private"]
+            return ["/usr", "/bin", "/sbin", "/opt", "/etc", "/Library", "/var", "/private"]
                 .filter { FileManager.default.fileExists(atPath: $0) }
                 .map { ($0, nil, false) }
         }

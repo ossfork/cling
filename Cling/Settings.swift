@@ -343,13 +343,14 @@ extension Defaults.Keys {
     static let maxResultsCount = Key<Int>("maxResultsCount", default: 1000)
     static let externalVolumes = Key<[FilePath]>("externalVolumes", default: [])
     static let disabledVolumes = Key<[FilePath]>("disabledVolumes", default: [])
+    static let indexedVolumePaths = Key<[FilePath]>("indexedVolumePaths", default: [])
     static let copyPathsWithTilde = Key<Bool>("copyPathsWithTilde", default: true)
 
     static let enableGlobalHotkey = Key<Bool>("enableGlobalHotkey", default: true)
     static let showAppKey = Key<SauceKey>("showAppKey", default: SauceKey.slash)
     static let triggerKeys = Key<[TriggerKey]>("triggerKeys", default: [.rcmd])
 
-    static let searchScopes = Key<[SearchScope]>("searchScopes", default: [.home, .library, .applications])
+    static let searchScopes = Key<[SearchScope]>("searchScopes", default: [.home, .library, .applications, .system, .root])
     static let quickFilters = Key<[QuickFilter]>("quickFilters", default: DEFAULT_QUICK_FILTERS)
     static let reindexTimeIntervalPerVolume = Key<[FilePath: Double]>("reindexTimeIntervalPerVolume", default: [:])
     static let windowAppearance = Key<WindowAppearance>("windowAppearance", default: WindowAppearance.defaultValue)

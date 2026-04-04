@@ -3,7 +3,10 @@ import Combine
 import Defaults
 import Foundation
 import Lowtech
+import os.log
 import System
+
+private let vlog = Logger(subsystem: "com.lowtechguys.Cling", category: "VolumeIndex")
 
 let DEFAULT_VOLUME_REINDEX_INTERVAL: TimeInterval = 60 * 60 * 24 * 7 // 1 week
 
@@ -11,13 +14,113 @@ func volumeIndexFile(_ volume: FilePath) -> FilePath {
     indexFolder / "\(volume.name.string.replacingOccurrences(of: " ", with: "-")).idx"
 }
 
+private func volumeCheckpointFile(_ volume: FilePath) -> URL {
+    volumeIndexFile(volume).url.deletingPathExtension().appendingPathExtension("checkpoint")
+}
+
+private final class VolumeIndexBatchTracker: @unchecked Sendable {
+    init(count: Int, onFinish: (@MainActor () -> Void)?) {
+        remaining = count
+        self.onFinish = onFinish
+    }
+
+    func finishOne() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        remaining -= 1
+        return remaining == 0
+    }
+
+    @MainActor
+    func runCompletionIfNeeded(_ shouldRun: Bool) {
+        guard shouldRun else { return }
+        onFinish?()
+    }
+
+    private var remaining: Int
+    private let onFinish: (@MainActor () -> Void)?
+    private let lock = NSLock()
+
+}
+
+/// Index a single volume into the given engine, picking the fastest traversal method:
+/// - Local external drives (USB, SSD, SD): fts with FTS_NOSTAT (getattrlistbulk)
+/// - SMB shares: native SMBClient.framework walk, falling back to FileManager
+/// - Other network volumes: FileManager with checkpointing
+private func indexVolumeEngine(
+    volume: FilePath,
+    engine: SearchEngine,
+    ignoreChecker: String?,
+    progress: @escaping (Int, String) -> Void,
+    cancelled: @escaping () -> Bool
+) async -> (added: Int, metadataCache: SMBMetadataCache?) {
+    let volumePath = volume.string
+    let skipDir: ((String) -> Bool)? = ignoreChecker.map { checker in
+        { path in path.isIgnored(in: checker) }
+    }
+    let isLocal = volume.url.isLocalVolume
+
+    // Local external drives: use fts (fastest, uses getattrlistbulk internally)
+    if isLocal {
+        vlog.info("Using fts walk for local volume \(volumePath)")
+        let added = engine.walkDirectory(
+            volumePath,
+            ignoreFile: ignoreChecker,
+            skipDir: skipDir,
+            progress: progress,
+            cancelled: cancelled
+        )
+        return (added, nil)
+    }
+
+    // SMB shares: try native SMB walk first
+    if isSMBVolume(volumePath) {
+        let metadataCache = SMBMetadataCache()
+        do {
+            let added = try await walkSMBShare(
+                engine: engine,
+                mountPoint: volumePath,
+                ignoreFile: ignoreChecker,
+                skipDir: skipDir,
+                metadataCache: metadataCache,
+                maxConcurrent: 8,
+                progress: progress,
+                cancelled: cancelled
+            )
+            vlog.info("SMB walk succeeded for \(volumePath): \(added) entries")
+            return (added, metadataCache)
+        } catch {
+            vlog.warning("SMB walk failed for \(volumePath), falling back to FileManager: \(error)")
+            engine.clear()
+        }
+    }
+
+    // Network fallback: FileManager with checkpointing for reliability
+    let cpFile = volumeIndexFile(volume).url.deletingPathExtension().appendingPathExtension("checkpoint")
+    let added = engine.walkDirectoryURL(
+        volumePath,
+        ignoreFile: ignoreChecker,
+        skipDir: skipDir,
+        checkpointFile: cpFile,
+        progress: progress,
+        cancelled: cancelled
+    )
+    return (added, nil)
+}
+
 extension FuzzyClient {
     var staleExternalVolumes: [FilePath] {
         enabledVolumes.filter { volume in
             guard volume.exists else { return false }
             let index = volumeIndexFile(volume)
+            let cpFile = index.url.deletingPathExtension().appendingPathExtension("checkpoint")
+            if FileManager.default.fileExists(atPath: cpFile.path) { return true } // interrupted indexing
+            guard index.exists else { return true }
+            let size = (try? FileManager.default.attributesOfItem(atPath: index.string)[.size] as? Int) ?? 0
+            if size <= 64 { return true } // empty or header-only index
+            if let engine = volumeEngines[volume], engine.count == 0 { return true } // loaded but empty
             let interval = Defaults[.reindexTimeIntervalPerVolume][volume] ?? DEFAULT_VOLUME_REINDEX_INTERVAL
-            return !index.exists || (index.timestamp ?? 0) < Date().addingTimeInterval(-interval).timeIntervalSince1970
+            return (index.timestamp ?? 0) < Date().addingTimeInterval(-interval).timeIntervalSince1970
         }
     }
 
@@ -47,6 +150,7 @@ extension FuzzyClient {
     }
 
     func indexStaleExternalVolumes() {
+        guard Defaults[.onboardingCompleted] else { return }
         let volumes = staleExternalVolumes
         guard !volumes.isEmpty else { return }
         indexVolumes(volumes)
@@ -56,64 +160,112 @@ extension FuzzyClient {
         enabledVolumes.map { volumeIndexFile($0) }
     }
 
-    func indexVolumes(_ volumes: [FilePath], onFinish: (@MainActor () -> Void)? = nil) {
-        let volumes = volumes.filter(\.exists)
-        guard !volumes.isEmpty else { return }
+    private func startVolumeIndexTask(_ volume: FilePath, batchTracker: VolumeIndexBatchTracker? = nil) {
+        guard volume.exists, !volumesIndexing.contains(volume) else { return }
 
         backgroundIndexing = true
-        let ignoreChecker = fsignore.exists ? (try? String(contentsOf: fsignore.url)) : nil
+        volumesIndexing.insert(volume)
 
-        let indexTask = Task.detached(priority: .utility) {
-            for volume in volumes {
-                guard !Task.isCancelled else { break }
-                let volumeName = volume.name.string
-                await MainActor.run { self.logActivity("Indexing volume: \(volumeName)", ongoing: true) }
+        let volumeFsignore = volume / ".fsignore"
+        let ignoreChecker: String? = volumeFsignore.exists ? (try? String(contentsOf: volumeFsignore.url)) : nil
+        let checkpointFile = volumeCheckpointFile(volume)
+        try? FileManager.default.removeItem(at: checkpointFile)
 
-                let volumeEngine = SearchEngine()
-                let skipDir: ((String) -> Bool)? = ignoreChecker.map { checker in
-                    { path in path.isIgnored(in: checker) }
-                }
-                // Use URL-based walker with checkpoint support for crash recovery
-                let cpFile = volumeIndexFile(volume).url.deletingPathExtension().appendingPathExtension("checkpoint")
-                let added = volumeEngine.walkDirectoryURL(volume.string, ignoreFile: ignoreChecker, skipDir: skipDir, checkpointFile: cpFile, progress: { count, lastPath in
+        let task = Task.detached(priority: .utility) {
+            let volumeName = volume.name.string
+            let opKey = "volume:\(volume.string)"
+            await MainActor.run { self.logActivity("Indexing volume: \(volumeName)", ongoing: true, operationKey: opKey) }
+
+            let volumeEngine = SearchEngine()
+            let result = await indexVolumeEngine(
+                volume: volume, engine: volumeEngine, ignoreChecker: ignoreChecker,
+                progress: { count, _ in
                     Task { @MainActor in
-                        self.logActivity("Indexing \(volumeName): \(count.formatted()) files", ongoing: true)
+                        self.logActivity("Indexing \(volumeName): \(count.formatted()) files", ongoing: true, operationKey: opKey)
                     }
-                }, cancelled: { Task.isCancelled })
+                },
+                cancelled: { Task.isCancelled }
+            )
 
-                // Save per-volume index
-                let file = volumeIndexFile(volume)
+            let wasCancelled = Task.isCancelled
+            let file = volumeIndexFile(volume)
+            if wasCancelled {
+                try? FileManager.default.removeItem(at: checkpointFile)
+                vlog.info("Cancelled volume indexing for \(volume.string)")
+            } else if result.added > 0 {
                 volumeEngine.saveBinaryIndex(to: file.url)
-                log.debug("Indexed volume \(volumeName): \(added) entries -> \(file.string)")
-
-                // Store as separate volume engine
-                await MainActor.run {
-                    self.volumeEngines[volume] = volumeEngine
-                    self.updateIndexedCount()
-                    self.logActivity("Indexed volume: \(volumeName) (\(added.formatted()) files)")
-                }
+                result.metadataCache?.save(to: smbMetadataCacheFile(volume))
+                log.debug("Indexed volume \(volumeName): \(result.added) entries -> \(file.string)")
             }
 
+            let shouldRunCompletion = batchTracker?.finishOne() ?? false
             await MainActor.run {
-                self.volumeIndexTask = nil
-                onFinish?()
-                self.backgroundIndexing = false
+                if !wasCancelled {
+                    self.volumeEngines[volume] = volumeEngine
+                    if let metaCache = result.metadataCache {
+                        self.smbMetadataCaches[volume] = metaCache
+                    }
+                    self.updateIndexedCount()
+                    self.logActivity("Indexed volume: \(volumeName) (\(result.added.formatted()) files)", operationKey: opKey)
+                    if result.added > 0, !Defaults[.indexedVolumePaths].contains(volume) {
+                        Defaults[.indexedVolumePaths].append(volume)
+                    }
+                } else {
+                    self.logActivity("Cancelled indexing: \(volumeName)", operationKey: opKey)
+                }
+
+                self.volumesIndexing.remove(volume)
+                self.volumeIndexTasks.removeValue(forKey: volume)
+                if self.volumesIndexing.isEmpty {
+                    self.backgroundIndexing = self.indexing
+                }
                 if !self.emptyQuery || self.volumeFilter != nil {
                     self.performSearch()
                 }
+                batchTracker?.runCompletionIfNeeded(shouldRunCompletion)
             }
         }
-        volumeIndexTask = indexTask
+
+        volumeIndexTasks[volume] = task
     }
 
-    func cancelVolumeIndexing() {
-        volumeIndexTask?.cancel()
-        volumeIndexTask = nil
-        backgroundIndexing = false
-        logActivity("Volume indexing cancelled")
+    func indexVolumes(_ volumes: [FilePath], onFinish: (@MainActor () -> Void)? = nil) {
+        let volumes = volumes.filter { $0.exists && !volumesIndexing.contains($0) }
+        guard !volumes.isEmpty else { return }
+
+        let batchTracker = VolumeIndexBatchTracker(count: volumes.count, onFinish: onFinish)
+        for volume in volumes {
+            startVolumeIndexTask(volume, batchTracker: batchTracker)
+        }
+    }
+
+    func cancelVolumeIndexing(volume: FilePath? = nil) {
+        if let volume {
+            volumeIndexTasks[volume]?.cancel()
+            logActivity("Cancelling indexing: \(volume.name.string)")
+        } else {
+            for task in volumeIndexTasks.values {
+                task.cancel()
+            }
+            logActivity("Cancelling volume indexing")
+        }
+    }
+
+    func cancelScopeIndexing() {
+        scopeIndexTask?.cancel()
+        scopeIndexTask = nil
+        indexing = false
+        backgroundIndexing = !volumesIndexing.isEmpty
+        logActivity("Scope indexing cancelled")
+    }
+
+    func cancelAllIndexing() {
+        cancelScopeIndexing()
+        cancelVolumeIndexing()
+        logActivity("All indexing cancelled")
     }
 
     func indexVolume(_ volume: FilePath) {
-        indexVolumes([volume])
+        startVolumeIndexTask(volume)
     }
 }
