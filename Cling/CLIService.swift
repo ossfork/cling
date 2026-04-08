@@ -283,7 +283,7 @@ extension FuzzyClient {
 
         case .index, .reindex:
             let scopes = request.scopes?.compactMap { SearchScope(rawValue: $0) }
-            let volumePaths = request.paths?.compactMap(\.filePath) ?? []
+            var volumePaths = request.paths?.compactMap(\.filePath) ?? []
 
             // Synchronously check for conflicts with any in-flight indexing and decide
             // whether to start a new batch, attach to the existing one, or reject.
@@ -294,6 +294,16 @@ extension FuzzyClient {
             let sem = DispatchSemaphore(value: 0)
             DispatchQueue.main.async {
                 defer { sem.signal() }
+
+                // Resolve unrecognized scope names as volume names
+                if let requestedScopes = request.scopes {
+                    let recognizedScopes = Set(scopes?.map(\.rawValue) ?? [])
+                    for name in requestedScopes where !recognizedScopes.contains(name) {
+                        if let volume = FUZZY.enabledVolumes.first(where: { $0.name.string == name }) {
+                            volumePaths.append(volume)
+                        }
+                    }
+                }
                 let activeScopeIndexing = FUZZY.scopesIndexing
                 let activeVolumeIndexing = FUZZY.volumesIndexing
                 let anyActive = !activeScopeIndexing.isEmpty || !activeVolumeIndexing.isEmpty || FUZZY.indexing

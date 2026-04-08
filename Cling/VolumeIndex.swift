@@ -167,7 +167,7 @@ extension FuzzyClient {
         volumesIndexing.insert(volume)
 
         let volumeFsignore = volume / ".fsignore"
-        let ignoreChecker: String? = volumeFsignore.exists ? (try? String(contentsOf: volumeFsignore.url)) : nil
+        let ignoreChecker: String? = volumeFsignore.exists ? volumeFsignore.string : nil
         let checkpointFile = volumeCheckpointFile(volume)
         try? FileManager.default.removeItem(at: checkpointFile)
 

@@ -345,6 +345,7 @@ extension Defaults.Keys {
     static let disabledVolumes = Key<[FilePath]>("disabledVolumes", default: [])
     static let indexedVolumePaths = Key<[FilePath]>("indexedVolumePaths", default: [])
     static let copyPathsWithTilde = Key<Bool>("copyPathsWithTilde", default: true)
+    static let fileOpDestinations = Key<[String: String]>("fileOpDestinations", default: [:])
 
     static let enableGlobalHotkey = Key<Bool>("enableGlobalHotkey", default: true)
     static let showAppKey = Key<SauceKey>("showAppKey", default: SauceKey.slash)

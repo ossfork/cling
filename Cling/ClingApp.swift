@@ -62,10 +62,6 @@ final class AppearanceManager {
 
 let AM = AppearanceManager.shared
 
-@inline(__always) var proactive: Bool {
-    (PRO?.productActivated ?? false) || (PRO?.onTrial ?? false)
-}
-
 var PRODUCTS: [Any] {
     if let product {
         [product]

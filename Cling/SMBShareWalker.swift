@@ -303,7 +303,8 @@ private func parseDirectoryBuffer(
     dirPath: String,
     mountPoint: String,
     skipHidden: Bool,
-    shouldSkip: (String) -> Bool
+    shouldSkip: (String) -> Bool,
+    shouldSkipTraversal: ((String) -> Bool)? = nil
 ) -> DirPage {
     let fixedSize = MemoryLayout<FileIdBothDirInfo>.size
     var paths: [(String, Bool, Int64, Date, Date)] = []
@@ -340,14 +341,15 @@ private func parseDirectoryBuffer(
                 let smbPath = makeAbsolutePath(parent: dirPath, child: name)
                 let localPath = mountPoint + smbPath
 
-                if !shouldSkip(localPath) {
+                let skipped = shouldSkip(localPath)
+                if !skipped {
                     let modDate = filetimeToDate(info.lastWriteTime)
                     let createDate = filetimeToDate(info.creationTime)
                     paths.append((localPath, isDir, info.endOfFile, modDate, createDate))
-
-                    if isDir, !isReparse {
-                        subdirs.append((path: smbPath, fileId: info.fileId))
-                    }
+                }
+                let skipTraversal = shouldSkipTraversal?(localPath) ?? shouldSkip(localPath)
+                if isDir, !isReparse, !skipTraversal {
+                    subdirs.append((path: smbPath, fileId: info.fileId))
                 }
             }
         }
@@ -369,6 +371,7 @@ private func querySingleDirectory(
     mountPoint: String,
     skipHidden: Bool,
     shouldSkip: @escaping (String) -> Bool,
+    shouldSkipTraversal: ((String) -> Bool)? = nil,
     createFn: SMBFramework.SMBCreateFile,
     closeFn: SMBFramework.SMBCloseFile,
     queryFn: SMBFramework.SMBQueryDir
@@ -425,7 +428,8 @@ private func querySingleDirectory(
 
         let page = parseDirectoryBuffer(
             buffer: buffer, returned: returned, dirPath: dirPath,
-            mountPoint: mountPoint, skipHidden: skipHidden, shouldSkip: shouldSkip
+            mountPoint: mountPoint, skipHidden: skipHidden, shouldSkip: shouldSkip,
+            shouldSkipTraversal: shouldSkipTraversal
         )
         allPaths.append(contentsOf: page.paths)
         allSubdirs.append(contentsOf: page.subdirectories)
@@ -482,6 +486,7 @@ func walkSMBShare(
 
     let ignoreContent: String? = ignoreFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
     let ignoredExtensions: Set<String> = ignoreContent.map { SearchEngine.extractExtensionPatterns(from: $0) } ?? []
+    let hasNegationPatterns: Bool = ignoreContent?.contains("\n!") == true || ignoreContent?.hasPrefix("!") == true
 
     let shouldSkip: (String) -> Bool = { path in
         if isPathBlocked(path) { return true }
@@ -491,6 +496,15 @@ func walkSMBShare(
             if ext.count > 1, ignoredExtensions.contains(ext) { return true }
         }
         if let ignoreFile, path.isIgnored(in: ignoreFile) { return true }
+        return false
+    }
+
+    // When negation patterns exist, a directory may be ignored but still
+    // need traversal so un-ignored descendants can be found.
+    let shouldSkipTraversal: (String) -> Bool = { path in
+        if isPathBlocked(path) { return true }
+        if let skipDir, skipDir(path) { return true }
+        if !hasNegationPatterns, let ignoreFile, path.isIgnored(in: ignoreFile) { return true }
         return false
     }
 
@@ -545,7 +559,7 @@ func walkSMBShare(
 
             let page = try querySingleDirectory(
                 conn: conn, dirPath: dirPath, mountPoint: mountPoint,
-                skipHidden: true, shouldSkip: shouldSkip,
+                skipHidden: true, shouldSkip: shouldSkip, shouldSkipTraversal: shouldSkipTraversal,
                 createFn: createFn, closeFn: closeFn, queryFn: queryFn
             )
             processDirPage(page)
@@ -576,7 +590,7 @@ func walkSMBShare(
                     group.addTask {
                         try querySingleDirectory(
                             conn: sendableConn.raw, dirPath: dirPath, mountPoint: mountPoint,
-                            skipHidden: true, shouldSkip: shouldSkip,
+                            skipHidden: true, shouldSkip: shouldSkip, shouldSkipTraversal: shouldSkipTraversal,
                             createFn: sendableCreateFn.fn, closeFn: sendableCloseFn.fn, queryFn: sendableQueryFn.fn
                         )
                     }

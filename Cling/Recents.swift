@@ -41,6 +41,9 @@ let sortComparator: MDQuerySortComparatorFunction = { values1, values2, context 
 extension MDQuery {
     @MainActor
     func getPaths() -> [FilePath] {
+        MDQueryDisableUpdates(self)
+        defer { MDQueryEnableUpdates(self) }
+
         var paths: [FilePath] = []
         for i in 0 ..< MDQueryGetResultCount(self) {
             guard let rawPtr = MDQueryGetResultAtIndex(self, i) else { continue }
@@ -85,23 +88,30 @@ let queryUpdateCallback: CFNotificationCallback = { notificationCenter, observer
 
     let query: MDQuery = unsafeBitCast(object, to: MDQuery.self)
 
+    let removedPaths: Set<String> = Set((removed ?? []).compactMap { MDItemCopyAttribute($0, kMDItemPath) as? String })
+
     mainActor {
-        let mdPaths = query.getPaths()
+        var mdPaths = query.getPaths()
+
+        // During heavy Spotlight activity (e.g. volume reindexing), updates can
+        // temporarily report many removals before re-adding them. To avoid
+        // flashing an empty recents list, keep previously known paths that
+        // weren't explicitly removed and still pass filters.
+        if mdPaths.count < FUZZY.mdQueryRecents.count {
+            let newSet = Set(mdPaths.map(\.string))
+            for fp in FUZZY.mdQueryRecents {
+                if !newSet.contains(fp.string), !removedPaths.contains(fp.string),
+                   !FUZZY.removedFiles.contains(fp.string),
+                   fp.exists
+                {
+                    mdPaths.append(fp)
+                }
+            }
+        }
+
         FUZZY.mdQueryRecents = mdPaths
         FUZZY.updateDefaultResults(debounce: true)
     }
-
-    // let changed = userInfo?[kMDQueryUpdateChangedItems] as? [MDItem]
-
-    // for item in added ?? [] {
-    //     print("Added: \(item.description)")
-    // }
-    // for item in removed ?? [] {
-    //     print("Removed: \(item.description)")
-    // }
-    // for item in changed ?? [] {
-    //     print("Changed: \(item.description)")
-    // }
 }
 
 extension MDItem {
@@ -252,10 +262,11 @@ func queryRecents() -> MDQuery? {
         return nil
     }
     MDQuerySetSearchScope(query, [kMDQueryScopeHome] as CFArray, 0)
-    MDQuerySetMaxCount(query, Defaults[.maxResultsCount])
+    let queryMaxCount = max(Defaults[.maxResultsCount] * 20, 5000)
+    MDQuerySetMaxCount(query, queryMaxCount)
     MDQuerySetSortComparator(query, sortComparator, nil)
     MDQuerySetDispatchQueue(query, .main)
-    log.debug("queryRecents: created query, maxCount=\(Defaults[.maxResultsCount])")
+    log.debug("queryRecents: created query, maxCount=\(queryMaxCount)")
 
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetLocalCenter(),

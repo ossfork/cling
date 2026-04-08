@@ -168,6 +168,10 @@ class FuzzyClient {
     @ObservationIgnored var mdQueryRecents: [FilePath] = [] // Raw MDQuery results (filtered)
     var commonOpenWithApps: [URL] = []
     var openWithAppShortcuts: [URL: Character] = [:]
+    var installedApps: [URL] = []
+    @ObservationIgnored nonisolated(unsafe) var appIconCache: [String: NSImage] = [:]
+    @ObservationIgnored var appDirWatchers: [DispatchSourceFileSystemObject] = []
+    @ObservationIgnored var appRefreshTask: DispatchWorkItem?
     var noQuery = true
     var searching = false
     var hasFullDiskAccess: Bool = FullDiskAccess.isGranted
@@ -179,7 +183,6 @@ class FuzzyClient {
         let mounted = Set(initialVolumes)
         return Set(Defaults[.indexedVolumePaths].filter { !mounted.contains($0) && !Defaults[.disabledVolumes].contains($0) })
     }()
-
     var readOnlyVolumes: [FilePath] = initialVolumes.filter(\.url.volumeIsReadOnly)
     @ObservationIgnored var quickFilterPool: [Int]? // Legacy, for CLI
     @ObservationIgnored var quickFilterPools: [String: [Int]] = [:] // Per-engine pools
@@ -217,6 +220,8 @@ class FuzzyClient {
     @ObservationIgnored var ongoingOperations: [String: String] = [:]
     @ObservationIgnored var ongoingOperationCounts: [String: Int] = [:]
     var ongoingOperationsList: [(key: String, message: String)] = []
+
+    @ObservationIgnored var appDiscoveryQuery: MetaQuery? { didSet { _ = oldValue } }
 
     var backgroundIndexing = false {
         didSet {
@@ -564,6 +569,8 @@ class FuzzyClient {
 
     func start() {
         startCLIListeners()
+        discoverInstalledApps()
+        watchAppDirectories()
 
         asyncNow {
             let clopIsAvailable = ClopSDK.shared.getClopAppURL() != nil
@@ -914,6 +921,7 @@ class FuzzyClient {
         scopesIndexing.formUnion(scopes)
         bust_gitignore_cache()
         let ignoreChecker: String? = fsignore.exists ? fsignoreString : nil
+        let volumePaths = Set(enabledVolumes.map(\.string))
 
         scopeIndexTask?.cancel()
         scopeIndexTask = Task.detached(priority: .userInitiated) {
@@ -929,7 +937,9 @@ class FuzzyClient {
                             }
                             let skipDir: ((String) -> Bool)? = { path in
                                 if isPathBlocked(path) { return true }
-                                return excludeSkip?(path) ?? false
+                                if excludeSkip?(path) ?? false { return true }
+                                if volumePaths.contains(path) { return true }
+                                return false
                             }
                             let ignore = dir.applyIgnore ? ignoreChecker : nil
                             let opKey = "scope:\(scope.rawValue)"
@@ -1547,6 +1557,50 @@ class FuzzyClient {
         computeOpenWithTask = mainAsyncAfter(ms: 100) { [self] in
             commonOpenWithApps = commonApplications(for: urls).sorted(by: \.lastPathComponent)
             openWithAppShortcuts = computeShortcuts(for: commonOpenWithApps)
+            for app in commonOpenWithApps where appIconCache[app.path] == nil {
+                let img = NSWorkspace.shared.icon(forFile: app.path)
+                img.size = NSSize(width: 16, height: 16)
+                appIconCache[app.path] = img
+            }
+        }
+    }
+
+    func discoverInstalledApps() {
+        appDiscoveryQuery = queryInstalledApps { [self] apps in
+            let filtered = apps.filter { isAppPathRelevant($0.path.string) }
+            let grouped = Dictionary(grouping: filtered, by: \.bundleIdentifier)
+            let unique = grouped.values.compactMap { $0.max(by: { $0.useCount < $1.useCount }) }
+            let urls = unique.map(\.url).sorted(by: \.lastPathComponent)
+
+            var icons: [String: NSImage] = [:]
+            for url in urls {
+                let img = NSWorkspace.shared.icon(forFile: url.path)
+                img.size = NSSize(width: 16, height: 16)
+                icons[url.path] = img
+            }
+
+            mainActor {
+                self.appIconCache = icons
+                self.installedApps = urls
+            }
+        }
+    }
+
+    func watchAppDirectories() {
+        for dir in APP_DIRS where !dir.hasPrefix("/System") {
+            let fd = open(dir, O_EVTONLY)
+            guard fd >= 0 else { continue }
+
+            let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename], queue: .main)
+            source.setEventHandler { [self] in
+                appRefreshTask?.cancel()
+                appRefreshTask = mainAsyncAfter(ms: 5000) {
+                    self.discoverInstalledApps()
+                }
+            }
+            source.setCancelHandler { close(fd) }
+            source.resume()
+            appDirWatchers.append(source)
         }
     }
 

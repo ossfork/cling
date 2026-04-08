@@ -385,6 +385,16 @@ struct ActionButtons: View {
 }
 
 struct FileOperationSheet: View {
+    init(operation: Operation, files: [FilePath], onComplete: @escaping (Set<FilePath>) -> Void = { _ in }) {
+        self.operation = operation
+        self.files = files
+        self.onComplete = onComplete
+
+        let ext = files.compactMap(\.extension).first ?? ""
+        let saved = Defaults[.fileOpDestinations][ext]
+        _destinationPath = State(initialValue: saved ?? "~/")
+    }
+
     enum Operation: String {
         case copy = "Copy"
         case move = "Move"
@@ -420,7 +430,7 @@ struct FileOperationSheet: View {
         .frame(width: 400)
     }
 
-    @State private var destinationPath = "~/"
+    @State private var destinationPath: String
     @Environment(\.dismiss) private var dismiss
 
     private func expandedURL() -> URL {
@@ -445,31 +455,82 @@ struct FileOperationSheet: View {
     private func perform() {
         let destURL = expandedURL()
         let destPath = destURL.path
+        let isSingleFile = files.count == 1
+        let hasTrailingSlash = destinationPath.trimmingCharacters(in: .whitespaces).hasSuffix("/")
 
-        var isDir: ObjCBool = false
-        if !FileManager.default.fileExists(atPath: destPath, isDirectory: &isDir) || !isDir.boolValue {
-            do {
-                try FileManager.default.createDirectory(atPath: destPath, withIntermediateDirectories: true)
-            } catch {
-                log.error("Failed to create directory \(destPath): \(error.localizedDescription)")
-                return
-            }
-        }
+        // Single file to a path without trailing slash: treat as a file destination
+        if isSingleFile, !hasTrailingSlash {
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: destPath, isDirectory: &isDir)
 
-        guard let dest = destURL.existingFilePath else { return }
-        var processed = Set<FilePath>()
-        for file in files {
-            do {
-                switch operation {
-                case .copy: try file.copy(to: dest)
-                case .move: try file.move(to: dest)
+            if exists, isDir.boolValue {
+                // Destination is an existing directory, copy/move into it
+                guard let dest = destURL.existingFilePath else { return }
+                do {
+                    switch operation {
+                    case .copy: try files[0].copy(to: dest)
+                    case .move: try files[0].move(to: dest)
+                    }
+                    onComplete(Set(files))
+                } catch {
+                    log.error("Failed to \(operation.rawValue.lowercased()) \(files[0].shellString) to \(dest.shellString): \(error.localizedDescription)")
                 }
-                processed.insert(file)
-            } catch {
-                log.error("Failed to \(operation.rawValue.lowercased()) \(file.shellString) to \(dest.shellString): \(error.localizedDescription)")
+            } else {
+                // Destination is a file path, ensure parent directory exists
+                let parentPath = destURL.deletingLastPathComponent().path
+                var parentIsDir: ObjCBool = false
+                if !FileManager.default.fileExists(atPath: parentPath, isDirectory: &parentIsDir) || !parentIsDir.boolValue {
+                    do {
+                        try FileManager.default.createDirectory(atPath: parentPath, withIntermediateDirectories: true)
+                    } catch {
+                        log.error("Failed to create directory \(parentPath): \(error.localizedDescription)")
+                        return
+                    }
+                }
+
+                let dest = FilePath(destPath)
+                do {
+                    switch operation {
+                    case .copy: try FileManager.default.copyItem(atPath: files[0].string, toPath: dest.string)
+                    case .move: try FileManager.default.moveItem(atPath: files[0].string, toPath: dest.string)
+                    }
+                    onComplete(Set(files))
+                } catch {
+                    log.error("Failed to \(operation.rawValue.lowercased()) \(files[0].shellString) to \(dest.shellString): \(error.localizedDescription)")
+                }
             }
+        } else {
+            // Multiple files or trailing slash: treat as directory destination
+            var isDir: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: destPath, isDirectory: &isDir) || !isDir.boolValue {
+                do {
+                    try FileManager.default.createDirectory(atPath: destPath, withIntermediateDirectories: true)
+                } catch {
+                    log.error("Failed to create directory \(destPath): \(error.localizedDescription)")
+                    return
+                }
+            }
+
+            guard let dest = destURL.existingFilePath else { return }
+            var processed = Set<FilePath>()
+            for file in files {
+                do {
+                    switch operation {
+                    case .copy: try file.copy(to: dest)
+                    case .move: try file.move(to: dest)
+                    }
+                    processed.insert(file)
+                } catch {
+                    log.error("Failed to \(operation.rawValue.lowercased()) \(file.shellString) to \(dest.shellString): \(error.localizedDescription)")
+                }
+            }
+            onComplete(processed)
         }
-        onComplete(processed)
+        let extensions = Set(files.compactMap(\.extension))
+        for ext in extensions {
+            Defaults[.fileOpDestinations][ext] = destinationPath
+        }
+
         dismiss()
     }
 }

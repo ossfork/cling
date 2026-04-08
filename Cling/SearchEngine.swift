@@ -1042,6 +1042,7 @@ final class SearchEngine: @unchecked Sendable {
         // Pre-extract extension patterns from ignore file content for fast file-level filtering
         let ignoreContent: String? = ignoreFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
         let ignoredExtensions: Set<String> = ignoreContent.map { Self.extractExtensionPatterns(from: $0) } ?? []
+        let hasNegationPatterns: Bool = ignoreContent?.contains("\n!") == true || ignoreContent?.hasPrefix("!") == true
 
         // The gitignore (swift-ignore / Rust `ignore` crate) panics if queried with a path
         // that is not a descendant of the ignore file's parent directory. Only apply the
@@ -1096,7 +1097,11 @@ final class SearchEngine: @unchecked Sendable {
                 let fullPath = String(decoding: UnsafeBufferPointer(start: pathPtr, count: pathLen), as: UTF8.self)
 
                 if let effectiveIgnoreFile, fullPath.isIgnored(in: effectiveIgnoreFile) {
-                    fts_set(ftsp, ent, Int32(FTS_SKIP))
+                    // When negation patterns exist (e.g. `*` + `!some/path/`), don't skip
+                    // ignored directories so that un-ignored descendants can still be visited.
+                    if !hasNegationPatterns {
+                        fts_set(ftsp, ent, Int32(FTS_SKIP))
+                    }
                     skippedIgnore &+= 1
                     continue
                 }
@@ -1184,6 +1189,7 @@ final class SearchEngine: @unchecked Sendable {
 
         let ignoreContent: String? = ignoreFile.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
         let ignoredExtensions: Set<String> = ignoreContent.map { Self.extractExtensionPatterns(from: $0) } ?? []
+        let hasNegationPatterns: Bool = ignoreContent?.contains("\n!") == true || ignoreContent?.hasPrefix("!") == true
 
         // Only apply ignore checks when the walked dir is under the ignore file's parent (see walkDirectory).
         let ignoreRootPrefix: String? = ignoreFile.flatMap { f -> String? in
@@ -1264,7 +1270,12 @@ final class SearchEngine: @unchecked Sendable {
 
                 if isDir {
                     if name == ".git" { continue }
-                    if let effectiveIgnoreFile, path.isIgnored(in: effectiveIgnoreFile) { continue }
+                    if let effectiveIgnoreFile, path.isIgnored(in: effectiveIgnoreFile) {
+                        // When negation patterns exist, keep traversing ignored dirs
+                        // so un-ignored descendants can still be found.
+                        if hasNegationPatterns { queue.append(url) }
+                        continue
+                    }
                     if let skipDir, skipDir(path) { continue }
                     queue.append(url)
                 } else {
